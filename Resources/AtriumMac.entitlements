@@ -1,0 +1,22 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  Entitlements for a hardened-runtime build.
+
+  Only applied when signing with a Developer ID — see CODESIGN_IDENTITY
+  in the Makefile. Notarization requires the hardened runtime, and the
+  hardened runtime blocks microphone access unless it is asked for here.
+
+  Not sandboxed. A sandboxed app cannot create a CoreAudio process tap
+  at all, which is how the far end of a call is recorded, and the whole
+  design rests on that. Sandboxing would also cut the app off from the
+  Recordings folder the user chooses in Settings.
+-->
+<plist version="1.0">
+<dict>
+	<!-- The microphone. Without it a hardened build records silence on
+	     the left channel and does not say why. -->
+	<key>com.apple.security.device.audio-input</key>
+	<true/>
+</dict>
+</plist>

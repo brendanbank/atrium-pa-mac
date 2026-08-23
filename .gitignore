@@ -1,0 +1,24 @@
+# SwiftPM
+.build/
+.swiftpm/
+Package.resolved
+
+# Bundled app output
+build/
+
+# Compiled probes (sources are tracked, binaries are not)
+Probes/mic-detect
+Probes/tap-probe
+Probes/tap-capture
+Probes/dump-procs
+Probes/win-titles
+Probes/Probe.app/
+*.dSYM/
+
+# Xcode
+*.xcodeproj/
+*.xcworkspace/
+xcuserdata/
+
+# macOS
+.DS_Store

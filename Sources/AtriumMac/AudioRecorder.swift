@@ -71,6 +71,10 @@ final class AudioRecorder {
         /// change is the likeliest reason for a stream that ends early.
         var inputDeviceChanged = false
 
+        /// How many times the capture followed the default input to a
+        /// different device during this segment.
+        var inputDeviceSwitches = 0
+
         /// How long the microphone had been delivering nothing when the
         /// segment closed.
         var micSilentForSeconds: TimeInterval?
@@ -110,6 +114,8 @@ final class AudioRecorder {
                 // durations, because a short microphone stream is the
                 // one failure here that produces a usable-looking file
                 // with half the conversation missing.
+                + (inputDeviceSwitches > 0
+                    ? " — followed the input device \(inputDeviceSwitches) time(s)" : "")
                 + (micShortfall > 1
                     ? String(
                         format: " — MICROPHONE SHORT BY %.1fs%@%@", micShortfall,
@@ -242,7 +248,10 @@ final class AudioRecorder {
             .appending(path: "\(stem).s\(index).mic.caf")
         let farDestination = AppPaths.recordings
             .appending(path: "\(stem).s\(index).far.caf")
-        let micRate = mic.deviceRate
+        // `outputRate`, not `deviceRate`: the file is written at one
+        // rate for its whole life, and the microphone may move to a
+        // device that runs at another. See `MicCapture.drain`.
+        let micRate = mic.outputRate > 0 ? mic.outputRate : mic.deviceRate
         let farRate = tap.tapRate
 
         // Mono Int16 CAF per stream, each at its own device's rate.
@@ -351,6 +360,7 @@ final class AudioRecorder {
             stats.micFramesProduced = mic.framesProduced
             stats.micCallbacks = mic.callbacks
             stats.inputDeviceChanged = mic.deviceChangedDuringCapture
+            stats.inputDeviceSwitches = mic.deviceSwitches
             stats.micSilentForSeconds = mic.silentFor
             sidecar.interrupted = interrupted
             sidecar.write(stem: stem)

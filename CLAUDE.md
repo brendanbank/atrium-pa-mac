@@ -395,11 +395,33 @@ device changes mid-recording, and it tracks how long the IOProc has been
 delivering nothing. None of that existed, which is why a 30-second hole
 had to be found by arithmetic on a frame count.
 
-**Not yet done:** re-binding to the new device mid-recording. Tearing
-down an IOProc and building another at a different rate while a file is
-open at the first rate is a bigger change than the evidence justifies —
-and it needs a real device switch to test against, which has happened
-exactly once.
+**The capture follows the default input now.** On a change it tears the
+IOProc down, resolves the new device and starts again —
+`MicCapture.followDefaultInputDevice`. Two things make that safe:
+
+* `outputRate` is fixed at the first `start()` and `drain()` resamples to
+  it, because `AudioRecorder` opened the master file at that rate and a
+  file cannot change rate halfway through. Measured switching to AirPods
+  mid-recording: the device arrives at **24 kHz** against the built-in
+  48, and the file stays 48. The resampling is on the consumer side, as
+  everything must be — allocating on a CoreAudio realtime thread is the
+  rule this design is arranged around.
+* The listener is removed before it is re-added. `start()` runs again on
+  every switch, and a second registration means two rebinds per change,
+  each tearing down what the other just built.
+
+The rebind costs about **a second** of microphone audio, which is the
+device teardown and spin-up. That is reported rather than hidden.
+
+**Residual, and it is a real one.** The drift cap is a percentage, and a
+lost second is not proportional to anything: 1 s missing from a 76 s take
+is 1.3% and is correctly refused, while the same second missing from an
+hour is 0.03% and would be absorbed as "drift" — stretching the whole
+hour to cover a hole in one place. Inaudible at that size, but the same
+mistake in miniature. The honest fix is to carry what the recorder knows
+— that a device switched, and for how long the microphone was silent —
+through the sidecar to the encoder, instead of inferring it from two
+durations.
 
 ## Two retention windows, because the two files are not worth the same
 

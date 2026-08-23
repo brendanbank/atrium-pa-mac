@@ -86,6 +86,23 @@ final class MicCapture {
     /// during capture — see the note on `drain`.
     private(set) var deviceRate: Double = 48_000
 
+    /// The rate `drain` delivers at, whatever device is underneath.
+    ///
+    /// Fixed at the first `start()` and held for the life of the
+    /// capture, because `AudioRecorder` opens the master file at this
+    /// rate and a file cannot change rate halfway through. When the
+    /// microphone moves to a device that runs at a different rate —
+    /// AirPods in hands-free mode are 16 kHz where the built-in mic is
+    /// 48 — the difference is resampled on the way out rather than
+    /// written into a file that claims otherwise.
+    private(set) var outputRate: Double = 0
+
+    /// Set when the device underneath is not running at `outputRate`.
+    private var rateAdapter: Resampler?
+
+    /// Devices this capture has been through, for the session log.
+    private(set) var deviceSwitches = 0
+
     /// Whether this app may use the microphone, in words.
     /// Whether the microphone question has been answered either way.
     /// `notDetermined` means the dialog is still on screen.
@@ -211,6 +228,12 @@ final class MicCapture {
         }
 
         deviceRate = format.mSampleRate
+        // The first device to arrive sets the rate everything downstream
+        // is built for.
+        if outputRate == 0 { outputRate = deviceRate }
+        rateAdapter =
+            deviceRate == outputRate
+            ? nil : Resampler(from: deviceRate, to: outputRate)
         let channels = max(Int(format.mChannelsPerFrame), 1)
         let isInterleaved = format.mFormatFlags & kAudioFormatFlagIsNonInterleaved == 0
 
@@ -322,6 +345,69 @@ final class MicCapture {
                 + "tcc \(Self.authorizationDescription)")
     }
 
+    /// Move the capture to whatever is now the default input.
+    ///
+    /// Two failures come from staying put, and which one you get depends
+    /// on whether the old device keeps running. Measured both ways:
+    /// a WhatsApp call where the old device stopped and the recording
+    /// lost its last 30 seconds, and a switch to AirPods where the old
+    /// device kept going and the rest of the take was recorded from the
+    /// built-in microphone instead — 37.2 s of audio, no shortfall, and
+    /// entirely the wrong input.
+    ///
+    /// The rate is allowed to change here; `outputRate` is not, and
+    /// `drain` resamples the difference. The master file was opened at
+    /// `outputRate` and cannot be told otherwise halfway through.
+    private func followDefaultInputDevice() {
+        guard isRunning else { return }
+
+        var device = AudioObjectID(0)
+        var address = CA.address(kAudioHardwarePropertyDefaultInputDevice)
+        var size = UInt32(MemoryLayout<AudioObjectID>.size)
+        guard
+            AudioObjectGetPropertyData(
+                AudioObjectID(kAudioObjectSystemObject), &address, 0, nil, &size,
+                &device) == noErr, device != 0
+        else {
+            Log.write("mic: the default input changed but resolves to nothing")
+            return
+        }
+        guard device != deviceID else { return }
+
+        let from = deviceID
+        let fromRate = deviceRate
+        deviceChangedDuringCapture = true
+        deviceSwitches += 1
+
+        // Tear the old one down first. `AudioDeviceStop` waits for an
+        // in-flight callback to finish, so nothing is reading the ring
+        // by the time it is freed.
+        if from != 0, let procID {
+            AudioDeviceStop(from, procID)
+            AudioDeviceDestroyIOProcID(from, procID)
+        }
+        self.procID = nil
+        isRunning = false
+        cleanup()
+
+        do {
+            try start()
+            Log.write(
+                "mic: followed the default input from device \(from) "
+                    + "(\(Int(fromRate)) Hz) to \(deviceID) (\(Int(deviceRate)) Hz)"
+                    + (rateAdapter == nil
+                        ? "" : ", resampling to \(Int(outputRate)) Hz for the file"))
+        } catch {
+            // The recording continues with a silent microphone rather
+            // than stopping: the far end is still being captured, and
+            // half a meeting is worth more than none. The session line
+            // reports the shortfall.
+            Log.write(
+                "mic: could not follow the default input from device \(from) — "
+                    + "\(error). The microphone is now silent for this recording.")
+        }
+    }
+
     /// Notice the default input device moving out from under us.
     ///
     /// The IOProc is bound to one device id, resolved once at `start()`.
@@ -337,14 +423,14 @@ final class MicCapture {
     /// cause visible in the session log, so a short microphone stream
     /// can be attributed rather than guessed at.
     private func watchForDeviceChange() {
+        // Removed first. `start()` runs again on every device switch, and
+        // a second registration would mean two rebinds per change, each
+        // tearing down the IOProc the other just built.
+        removeDeviceListener()
         var address = CA.address(kAudioHardwarePropertyDefaultInputDevice)
         let block: AudioObjectPropertyListenerBlock = { [weak self] _, _ in
             guard let self, self.isRunning else { return }
-            self.deviceChangedDuringCapture = true
-            Log.write(
-                "mic: the default input device changed mid-recording — "
-                    + "the capture is still bound to device \(self.deviceID), "
-                    + "which may have stopped")
+            self.followDefaultInputDevice()
         }
         if AudioObjectAddPropertyListenerBlock(
             AudioObjectID(kAudioObjectSystemObject), &address,
@@ -354,15 +440,25 @@ final class MicCapture {
         }
     }
 
+    private func removeDeviceListener() {
+        guard let deviceListener else { return }
+        var address = CA.address(kAudioHardwarePropertyDefaultInputDevice)
+        AudioObjectRemovePropertyListenerBlock(
+            AudioObjectID(kAudioObjectSystemObject), &address,
+            DispatchQueue.main, deviceListener)
+        self.deviceListener = nil
+    }
+
     func stop() {
         guard isRunning else { return }
-        if let deviceListener {
-            var address = CA.address(kAudioHardwarePropertyDefaultInputDevice)
-            AudioObjectRemovePropertyListenerBlock(
-                AudioObjectID(kAudioObjectSystemObject), &address,
-                DispatchQueue.main, deviceListener)
-            self.deviceListener = nil
-        }
+        removeDeviceListener()
+        // Released here and not in `cleanup()`, which the device-switch
+        // path also calls: the output rate has to survive a switch,
+        // because the file being written is at that rate.
+        outputRate = 0
+        rateAdapter = nil
+        deviceSwitches = 0
+        deviceChangedDuringCapture = false
         if deviceID != 0, let procID {
             AudioDeviceStop(deviceID, procID)
             AudioDeviceDestroyIOProcID(deviceID, procID)
@@ -399,14 +495,38 @@ final class MicCapture {
     ///
     /// The microphone now gets its own file at its own rate, and the
     /// rates are reconciled once, offline, in `AudioEncoder`.
+    /// Frames at `outputRate`, whichever device is underneath.
+    ///
+    /// The resampling happens here, on an ordinary thread, and never in
+    /// the IOProc — allocating on a CoreAudio realtime thread is the
+    /// rule this whole design is arranged around. `Resampler` keeps its
+    /// own state across calls, so a device switch does not put a seam in
+    /// the audio.
     func drain(maxFrames: Int) -> [Float] {
         guard let ring, maxFrames > 0 else { return [] }
-        var out = [Float](repeating: 0, count: maxFrames)
-        let got = out.withUnsafeMutableBufferPointer { buffer -> Int in
-            arb_read(ring, buffer.baseAddress!, maxFrames)
+
+        guard let rateAdapter else {
+            var out = [Float](repeating: 0, count: maxFrames)
+            let got = out.withUnsafeMutableBufferPointer { buffer -> Int in
+                arb_read(ring, buffer.baseAddress!, maxFrames)
+            }
+            out.removeLast(out.count - got)
+            return out
         }
-        out.removeLast(out.count - got)
-        return out
+
+        // Ask the ring for as much as this many output frames needs.
+        let wanted = rateAdapter.inputNeeded(forOutput: maxFrames)
+        if wanted > 0 {
+            var raw = [Float](repeating: 0, count: wanted)
+            let got = raw.withUnsafeMutableBufferPointer { buffer -> Int in
+                arb_read(ring, buffer.baseAddress!, wanted)
+            }
+            if got > 0 {
+                raw.removeLast(raw.count - got)
+                rateAdapter.push(raw)
+            }
+        }
+        return rateAdapter.pull(maxFrames: maxFrames)
     }
 
     /// Frames waiting, at the device's rate.

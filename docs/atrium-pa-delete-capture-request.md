@@ -118,7 +118,7 @@ depends on it.
 >
 > ### Why I am asking rather than sending a PR
 >
-> `atrium-mac` is deliberately a zero-change client of this API: its
+> `atrium-pa-mac` is deliberately a zero-change client of this API: its
 > whole contract is "use what ingest already exposes". Adding a REST
 > endpoint or an MCP tool from that side was considered and rejected
 > when the upload lane was built, on the grounds that a single personal
@@ -144,7 +144,7 @@ reflected in `MCPClient.deleteCapture` and in the delete dialog:
    deletion there would hand it to every browser client that
    re-registers on reconnect, which is the same silent widening the
    separate-scope argument exists to prevent, arriving by another door.
-   atrium-mac already sends `scope` explicitly at registration, so this
+   atrium-pa-mac already sends `scope` explicitly at registration, so this
    costs nothing here; it is load-bearing rather than incidental.
 2. **The audio is not deleted.** This request assumed the purge job
    removes vault blobs. It does not — it hard-deletes the capture row and

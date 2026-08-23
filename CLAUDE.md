@@ -1,13 +1,13 @@
-# atrium-mac — agent guide
+# atrium-pa-mac — agent guide
 
 Menu-bar macOS app that detects when a meeting app grabs the microphone,
 records both sides of the conversation, and uploads the audio to
 **Atrium PA** for transcription.
 
-Companion to [`atrium-pa`](https://github.com/Brendan-Bank/atrium-pa).
-Check it out alongside this one and read it for the ingest contract. **This project makes no changes to atrium-pa**; see §"The
-upload contract" for why that is a deliberate constraint, not an
-accident.
+Companion to [`atrium-pa`](https://github.com/Brendan-Bank/atrium-pa) —
+check it out alongside this one and read it for the ingest contract.
+**This project makes no changes to atrium-pa**; see §"The upload
+contract" for why that is a deliberate constraint, not an accident.
 
 ---
 

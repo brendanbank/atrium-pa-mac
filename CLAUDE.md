@@ -413,15 +413,23 @@ IOProc down, resolves the new device and starts again —
 The rebind costs about **a second** of microphone audio, which is the
 device teardown and spin-up. That is reported rather than hidden.
 
-**Residual, and it is a real one.** The drift cap is a percentage, and a
-lost second is not proportional to anything: 1 s missing from a 76 s take
-is 1.3% and is correctly refused, while the same second missing from an
-hour is 0.03% and would be absorbed as "drift" — stretching the whole
-hour to cover a hole in one place. Inaudible at that size, but the same
-mistake in miniature. The honest fix is to carry what the recorder knows
-— that a device switched, and for how long the microphone was silent —
-through the sidecar to the encoder, instead of inferring it from two
-durations.
+**A residual that stopped mattering.** The drift cap is a percentage,
+and a lost second is not proportional to anything — so a gap under 0.5%
+of the recording is absorbed as drift rather than padded. That was worth
+worrying about while a device switch could cost thirty seconds: in an
+hour, anything up to eighteen would have slipped under the cap and been
+smeared across the whole recording.
+
+It no longer can. Following the device bounds a switch to about a second,
+and the two-second stall check bounds an unnoticed stop to two or three.
+A few seconds inside an hour is under 0.1% — inside the cap, absorbed,
+and genuinely inaudible.
+
+So this is not worth fixing, and the reason is worth keeping: the fix was
+never needed on its own terms. It was needed because something else was
+broken, and fixing that removed the input this depended on. If the
+session line ever reports a large shortfall again, revisit it — the
+numbers are all in the log.
 
 ## The log is for the pipeline, not for the window
 

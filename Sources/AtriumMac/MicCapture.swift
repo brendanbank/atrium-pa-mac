@@ -421,6 +421,41 @@ final class MicCapture {
         }
     }
 
+    /// Restart if the IOProc has gone quiet without the device changing.
+    ///
+    /// Creating the far-end tap's aggregate device is a CoreAudio
+    /// hardware reconfiguration, and it knocks over an input client that
+    /// started a moment earlier — which is why `AudioRecorder` starts
+    /// the tap first. When the tap has to be rebuilt *during* a
+    /// recording, that hazard arrives in the middle instead, and the
+    /// default input device has not changed, so nothing else notices.
+    @discardableResult
+    func restartIfStalled(quietFor threshold: TimeInterval = 1.0) -> Bool {
+        guard isRunning, let silent = silentFor, silent > threshold else { return false }
+        Log.write(
+            String(
+                format: "mic: no frames for %.1fs and the device did not change — "
+                    + "restarting the capture", silent))
+        isFollowingDevice = true
+        defer { isFollowingDevice = false }
+
+        if deviceID != 0, let procID {
+            AudioDeviceStop(deviceID, procID)
+            AudioDeviceDestroyIOProcID(deviceID, procID)
+        }
+        self.procID = nil
+        isRunning = false
+        cleanup()
+        do {
+            try start()
+            Log.write("mic: restarted on device \(deviceID)")
+            return true
+        } catch {
+            Log.write("mic: could not restart after a stall — \(error)")
+            return false
+        }
+    }
+
     /// Notice the default input device moving out from under us.
     ///
     /// The IOProc is bound to one device id, resolved once at `start()`.

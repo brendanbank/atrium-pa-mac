@@ -75,6 +75,14 @@ final class AudioRecorder {
         /// different device during this segment.
         var inputDeviceSwitches = 0
 
+        /// The same for the far end, which follows the default output.
+        var outputDeviceSwitches = 0
+
+        /// How much far-end audio is missing relative to the microphone.
+        /// The tap dying is as real a failure as the microphone dying,
+        /// and until now only one of them was reported.
+        var farShortfall: TimeInterval { max(0, micDuration - farDuration) }
+
         /// How long the microphone had been delivering nothing when the
         /// segment closed.
         var micSilentForSeconds: TimeInterval?
@@ -116,6 +124,11 @@ final class AudioRecorder {
                 // with half the conversation missing.
                 + (inputDeviceSwitches > 0
                     ? " — followed the input device \(inputDeviceSwitches) time(s)" : "")
+                + (outputDeviceSwitches > 0
+                    ? " — followed the output device \(outputDeviceSwitches) time(s)"
+                    : "")
+                + (farShortfall > 1
+                    ? String(format: " — FAR END SHORT BY %.1fs", farShortfall) : "")
                 + (micShortfall > 1
                     ? String(
                         format: " — MICROPHONE SHORT BY %.1fs%@%@", micShortfall,
@@ -176,6 +189,11 @@ final class AudioRecorder {
     /// hold, so it is neither a latency nor an overrun risk.
     private let drainInterval: TimeInterval = 0.04
 
+    /// Watches for either stream going quiet. Separate from the drain
+    /// timer because a stall check that runs 25 times a second would be
+    /// its own kind of noise.
+    private var stallCheck: Timer?
+
     /// How long to wait for the first mic buffer before recording the
     /// far-end alone. A denied or absent mic must not cost the meeting.
     private let micStartGrace: TimeInterval = 2.0
@@ -228,6 +246,17 @@ final class AudioRecorder {
         // is a CoreAudio hardware reconfiguration, which knocks over an
         // input client that started a moment earlier.
         var warnings: [String] = []
+        // Rebuilding the tap reconfigures CoreAudio hardware, which is
+        // exactly what knocks over an input client — the reason the tap
+        // is started before the microphone below. When that happens
+        // mid-recording the microphone can stop with no device change to
+        // notice, so it is checked once the dust settles.
+        tap.onRebuilt = { [weak self] in
+            guard let self else { return }
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
+                self.mic.restartIfStalled()
+            }
+        }
         do {
             try tap.start()
         } catch {
@@ -252,7 +281,7 @@ final class AudioRecorder {
         // rate for its whole life, and the microphone may move to a
         // device that runs at another. See `MicCapture.drain`.
         let micRate = mic.outputRate > 0 ? mic.outputRate : mic.deviceRate
-        let farRate = tap.tapRate
+        let farRate = tap.outputRate > 0 ? tap.outputRate : tap.tapRate
 
         // Mono Int16 CAF per stream, each at its own device's rate.
         func settings(rate: Double) -> [String: Any] {
@@ -322,6 +351,18 @@ final class AudioRecorder {
 
         let timer = DispatchSource.makeTimerSource(queue: queue)
         timer.schedule(deadline: .now() + drainInterval, repeating: drainInterval)
+        // Both streams are checked for having stopped, not only for
+        // their device having changed. A device that vanishes takes the
+        // stream with it and updates the default-device property some
+        // time later — 28 seconds later, measured — and everything in
+        // between is audio nobody recorded.
+        stallCheck?.invalidate()
+        stallCheck = Timer.scheduledTimer(withTimeInterval: 2, repeats: true) {
+            [weak self] _ in
+            guard let self, self.isRecording else { return }
+            self.tap.restartIfStalled()
+            self.mic.restartIfStalled()
+        }
         timer.setEventHandler { [weak self] in self?.drain() }
         timer.resume()
         self.timer = timer
@@ -344,6 +385,8 @@ final class AudioRecorder {
     func finish(interrupted: Bool = false) -> Recording? {
         timer?.cancel()
         timer = nil
+        stallCheck?.invalidate()
+        stallCheck = nil
 
         // Drain *before* stopping the producers. `ProcessTap.stop()`
         // destroys its ring, so the order here is the difference between
@@ -361,6 +404,7 @@ final class AudioRecorder {
             stats.micCallbacks = mic.callbacks
             stats.inputDeviceChanged = mic.deviceChangedDuringCapture
             stats.inputDeviceSwitches = mic.deviceSwitches
+            stats.outputDeviceSwitches = tap.deviceSwitches
             stats.micSilentForSeconds = mic.silentFor
             sidecar.interrupted = interrupted
             sidecar.write(stem: stem)

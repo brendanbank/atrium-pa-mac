@@ -60,6 +60,67 @@ final class ProcessTap {
     /// What the aggregate device actually runs at, read at start rather
     /// than assumed. See the note in `start()`.
     private(set) var tapRate: Double = 48_000
+
+    /// The rate `drain` delivers at, whatever aggregate is underneath.
+    ///
+    /// Fixed at the first `start()`, for the same reason
+    /// `MicCapture.outputRate` is: the master file is opened at this
+    /// rate and cannot change halfway through. The aggregate is built
+    /// around the default *output* device, and that device can change —
+    /// AirPods arriving is the ordinary case — bringing a different rate
+    /// with it.
+    private(set) var outputRate: Double = 0
+    private var rateAdapter: Resampler?
+
+    /// The exclusion list this tap was built with, so a rebuild uses the
+    /// same one. Excluding our own process is what stops the recording
+    /// feeding back into itself.
+    private var excluded: [AudioObjectID] = []
+
+    /// The output device UID the current aggregate was built around.
+    ///
+    /// Compared before rebuilding, because **creating an aggregate
+    /// device re-fires the default-output-device property**. Without
+    /// this the first rebuild triggers the next: measured, ten rebuilds
+    /// in under two seconds, each one costing far-end audio. The
+    /// microphone has always had the equivalent guard —
+    /// `device != deviceID` — and the tap did not.
+    private var builtAroundUID: String?
+
+    /// Times the tap followed the output device during this capture.
+    private(set) var deviceSwitches = 0
+    private var isFollowingDevice = false
+
+    /// When the IOProc last delivered, on the system clock.
+    ///
+    /// The far-end tap runs continuously whether or not anything is
+    /// playing, so "no frames for a second" means the stream is gone —
+    /// not that the meeting went quiet. That is what makes a stall
+    /// detectable here at all.
+    private(set) var lastFrameSeconds: TimeInterval = 0
+
+    /// Frames the tap has produced, and when it started producing them.
+    /// Together these give the rate it is *really* running at, which is
+    /// not always the rate it reports.
+    private(set) var framesProduced: Int = 0
+    private var producingSince: TimeInterval = 0
+
+    /// Seconds since the tap last delivered, or nil if it never has.
+    var silentFor: TimeInterval? {
+        guard lastFrameSeconds > 0 else { return nil }
+        return ProcessInfo.processInfo.systemUptime - lastFrameSeconds
+    }
+    private var outputListener: AudioObjectPropertyListenerBlock?
+
+    /// Called after the tap has been rebuilt around a new output device.
+    ///
+    /// Rebuilding creates an aggregate device, which is a CoreAudio
+    /// hardware reconfiguration — the same one that knocks over an input
+    /// client started a moment earlier, which is why `AudioRecorder`
+    /// starts the tap before the microphone. Doing it mid-recording can
+    /// therefore silence the microphone, so whoever owns both is told
+    /// and can check.
+    var onRebuilt: (() -> Void)?
     private var tapChannels: Int = 2
 
     /// Pre-allocated mono scratch for the realtime callback.
@@ -85,6 +146,7 @@ final class ProcessTap {
     /// Start tapping. Pass process object IDs to scope the tap, or an
     /// empty array to tap everything except this process.
     func start(excluding excludedProcesses: [AudioObjectID] = []) throws {
+        excluded = excludedProcesses
         let description = CATapDescription(
             stereoGlobalTapButExcludeProcesses: excludedProcesses)
         description.name = "Atrium PA meeting capture"
@@ -153,8 +215,36 @@ final class ProcessTap {
             tapRate = Self.workingRate
             tapChannels = 2
         }
+        // The first aggregate to arrive sets the rate the file is
+        // written at; later ones are resampled to it in `drain`.
+        if outputRate == 0 { outputRate = tapRate }
+        rateAdapter =
+            tapRate == outputRate ? nil : Resampler(from: tapRate, to: outputRate)
+        if tapRate != outputRate, rateAdapter == nil {
+            // Silently writing frames at the wrong rate is the failure
+            // this whole arrangement exists to prevent, so say so.
+            Log.write(
+                "tap: could not build a resampler from \(Int(tapRate)) to "
+                    + "\(Int(outputRate)) Hz — the far end will be at the wrong speed")
+        }
+        builtAroundUID = CA.defaultOutputDeviceUID()
+        framesProduced = 0
+        producingSince = ProcessInfo.processInfo.systemUptime
         Log.write(
             "tap: aggregate device runs at \(Int(tapRate)) Hz, \(tapChannels) ch")
+
+        // Check what it is *actually* delivering, a moment later.
+        //
+        // An aggregate built around a Bluetooth device reports the rate
+        // it had when it was created, and the link can settle to another
+        // one after that — AirPods drop to 24 kHz when they are also the
+        // input. Measured: the aggregate said 48000 while delivering
+        // frames at about half that, so a 28-second stretch of call
+        // became 13 seconds of far-end audio and the rest looked like
+        // loss.
+        DispatchQueue.main.asyncAfter(deadline: .now() + 3) { [weak self] in
+            self?.checkDeliveredRate()
+        }
 
         // Mono at the device's own rate. Mono because the recorder wants
         // one far-end channel and folding here is a handful of adds on a
@@ -241,7 +331,13 @@ final class ProcessTap {
                 }
             }
 
-            if frames > 0 { _ = arb_write(ringPointer, scratch, frames) }
+            if frames > 0 {
+                _ = arb_write(ringPointer, scratch, frames)
+                self.framesProduced += frames
+                // One store of a POD on a realtime thread; see
+                // MicCapture for why nothing more happens here.
+                self.lastFrameSeconds = ProcessInfo.processInfo.systemUptime
+            }
             if localPeak > self.peakAmplitude { self.peakAmplitude = localPeak }
         }
 
@@ -256,9 +352,130 @@ final class ProcessTap {
             cleanup()
             throw TapError.startFailed(startStatus)
         }
+        watchForOutputDeviceChange()
+    }
+
+    /// Follow the default output device.
+    ///
+    /// The aggregate is built around one output UID, resolved once. When
+    /// the default output changes the tap is left wrapped around a
+    /// device that is no longer playing the call, and the far end simply
+    /// stops. Measured: a 38-second recording whose far end ended at 19
+    /// seconds when the output moved, with nothing in the log to say so.
+    private func watchForOutputDeviceChange() {
+        removeOutputListener()
+        var address = CA.address(kAudioHardwarePropertyDefaultOutputDevice)
+        let block: AudioObjectPropertyListenerBlock = { [weak self] _, _ in
+            self?.followDefaultOutputDevice()
+        }
+        if AudioObjectAddPropertyListenerBlock(
+            AudioObjectID(kAudioObjectSystemObject), &address,
+            DispatchQueue.main, block) == noErr
+        {
+            outputListener = block
+        }
+    }
+
+    private func removeOutputListener() {
+        guard let outputListener else { return }
+        var address = CA.address(kAudioHardwarePropertyDefaultOutputDevice)
+        AudioObjectRemovePropertyListenerBlock(
+            AudioObjectID(kAudioObjectSystemObject), &address,
+            DispatchQueue.main, outputListener)
+        self.outputListener = nil
+    }
+
+    /// Compare the rate the aggregate claims against what it delivers.
+    ///
+    /// The claimed rate decides how many frames a second of audio is,
+    /// so believing a wrong one stretches or squashes the far end for
+    /// the rest of the recording. This does not correct it — the file is
+    /// already open at `outputRate` — but it says so plainly, which is
+    /// the difference between a diagnosable recording and a mystery.
+    private func checkDeliveredRate() {
+        guard procID != nil, producingSince > 0, framesProduced > 0 else { return }
+        let elapsed = ProcessInfo.processInfo.systemUptime - producingSince
+        guard elapsed > 1 else { return }
+
+        let delivered = Double(framesProduced) / elapsed
+        let ratio = delivered / tapRate
+        guard ratio < 0.9 || ratio > 1.1 else { return }
+        Log.write(
+            String(
+                format: "tap: the aggregate claims %.0f Hz but is delivering %.0f — "
+                    + "the far end will be %.0f%% of its true length",
+                tapRate, delivered, ratio * 100))
+    }
+
+    /// Rebuild if the tap has stopped delivering.
+    ///
+    /// Measured: AirPods going away took the aggregate's sub-device with
+    /// them and the far end stopped, while
+    /// `kAudioHardwarePropertyDefaultOutputDevice` did not change for
+    /// another 28 seconds. Watching the device property alone lost that
+    /// half-minute; the stream going quiet is the earlier and more
+    /// direct signal, and the tap runs continuously whether or not
+    /// anything is playing, so quiet means gone rather than silent.
+    @discardableResult
+    func restartIfStalled(quietFor threshold: TimeInterval = 1.5) -> Bool {
+        guard procID != nil, let silent = silentFor, silent > threshold else {
+            return false
+        }
+        Log.write(
+            String(
+                format: "tap: no far-end frames for %.1fs — rebuilding", silent))
+        followDefaultOutputDevice(force: true)
+        return true
+    }
+
+    private func followDefaultOutputDevice(force: Bool = false) {
+        guard procID != nil else { return }
+        // Re-entrancy: `start()` below creates an aggregate, which fires
+        // this listener again while we are still inside it.
+        guard !isFollowingDevice else { return }
+
+        let current = CA.defaultOutputDeviceUID()
+        if !force, let current, current == builtAroundUID {
+            // The property fired but the device did not actually change,
+            // which is what building an aggregate looks like from here.
+            return
+        }
+
+        let wasRate = tapRate
+        deviceSwitches += 1
+
+        if aggregateID != 0, let procID {
+            AudioDeviceStop(aggregateID, procID)
+            AudioDeviceDestroyIOProcID(aggregateID, procID)
+        }
+        procID = nil
+        cleanup()
+
+        isFollowingDevice = true
+        defer { isFollowingDevice = false }
+        do {
+            try start(excluding: excluded)
+            Log.write(
+                "tap: followed the default output device — now \(Int(tapRate)) Hz "
+                    + "(was \(Int(wasRate)))"
+                    + (rateAdapter == nil
+                        ? "" : ", resampling to \(Int(outputRate)) Hz for the file"))
+            onRebuilt?()
+        } catch {
+            // The microphone keeps recording. Half a meeting is worth
+            // more than none, and the encoder pads the far end.
+            Log.write(
+                "tap: could not follow the default output device — \(error). "
+                    + "The far end is silent for the rest of this recording.")
+        }
     }
 
     func stop() {
+        removeOutputListener()
+        builtAroundUID = nil
+        outputRate = 0
+        rateAdapter = nil
+        deviceSwitches = 0
         if aggregateID != 0, let procID {
             AudioDeviceStop(aggregateID, procID)
             AudioDeviceDestroyIOProcID(aggregateID, procID)
@@ -279,12 +496,31 @@ final class ProcessTap {
     /// `AudioEncoder`.
     func drain(maxFrames: Int) -> [Float] {
         guard let ring, maxFrames > 0 else { return [] }
-        var out = [Float](repeating: 0, count: maxFrames)
-        let got = out.withUnsafeMutableBufferPointer { buffer -> Int in
-            arb_read(ring, buffer.baseAddress!, maxFrames)
+
+        guard let rateAdapter else {
+            var out = [Float](repeating: 0, count: maxFrames)
+            let got = out.withUnsafeMutableBufferPointer { buffer -> Int in
+                arb_read(ring, buffer.baseAddress!, maxFrames)
+            }
+            out.removeLast(out.count - got)
+            return out
         }
-        out.removeLast(out.count - got)
-        return out
+
+        // Only after the output device has changed to one with a
+        // different rate. The comment above still holds for the ordinary
+        // case: nothing is resampled while a single device is running.
+        let wanted = rateAdapter.inputNeeded(forOutput: maxFrames)
+        if wanted > 0 {
+            var raw = [Float](repeating: 0, count: wanted)
+            let got = raw.withUnsafeMutableBufferPointer { buffer -> Int in
+                arb_read(ring, buffer.baseAddress!, wanted)
+            }
+            if got > 0 {
+                raw.removeLast(raw.count - got)
+                rateAdapter.push(raw)
+            }
+        }
+        return rateAdapter.pull(maxFrames: maxFrames)
     }
 
     /// Frames waiting, at the device's rate.

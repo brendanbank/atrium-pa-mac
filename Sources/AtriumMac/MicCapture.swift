@@ -103,6 +103,10 @@ final class MicCapture {
     /// Devices this capture has been through, for the session log.
     private(set) var deviceSwitches = 0
 
+    /// True only while `start()` is being called to follow a device
+    /// change, so it can tell a fresh capture from a continuation.
+    private var isFollowingDevice = false
+
     /// Whether this app may use the microphone, in words.
     /// Whether the microphone question has been answered either way.
     /// `notDetermined` means the dialog is still on screen.
@@ -243,9 +247,16 @@ final class MicCapture {
         }
         self.ring = ring
 
-        peakAmplitude = 0
-        framesProduced = 0
-        callbacks = 0
+        // Counters survive a device switch. `start()` runs again on
+        // every rebind, and zeroing here made the session line report
+        // only the frames since the last switch — under a heading that
+        // reads like the whole recording. These numbers are what a short
+        // stream gets diagnosed from, so they have to cover it.
+        if !isFollowingDevice {
+            peakAmplitude = 0
+            framesProduced = 0
+            callbacks = 0
+        }
 
         // Allocated once, so the realtime callback never does. CoreAudio
         // asks for 512–4096 frames in practice; this is far above that.
@@ -390,6 +401,8 @@ final class MicCapture {
         isRunning = false
         cleanup()
 
+        isFollowingDevice = true
+        defer { isFollowingDevice = false }
         do {
             try start()
             Log.write(

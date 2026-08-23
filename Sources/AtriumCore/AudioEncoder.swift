@@ -330,10 +330,16 @@ public enum AudioEncoder {
                     mic.duration, mic.rate, micEffective, skew * 100,
                     corrected
                         ? "— corrected as drift"
-                        : "— NOT corrected, too large for a clock; "
-                            + "padding the microphone with silence instead",
+                        : "— NOT corrected, too large for a clock; padding "
+                            + "the shorter stream with silence instead",
                     far?.duration ?? 0, far?.rate ?? 0))
-            if !corrected {
+            // Under a second is the aggregate device spinning up, not
+            // drift and not loss. On a fourteen-second recording that
+            // offset is 2.9% and used to be announced as a fault; on an
+            // hour it is 0.01% and says nothing. The absolute size is
+            // what makes it uninteresting, so that is what is tested.
+            let difference = abs(referenceSeconds - mic.duration)
+            if !corrected, difference >= 1 {
                 let micShort = referenceSeconds - mic.duration
                 Log.write(
                     micShort > 0

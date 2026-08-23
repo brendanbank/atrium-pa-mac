@@ -870,9 +870,19 @@ public actor UploadQueue {
             Log.write(
                 "pipeline: capture \(captureID) ready — transcript "
                     + "\(status.transcriptID.map(String.init) ?? "?"), "
-                    + (status.unknownSpeakers.isEmpty
-                        ? "no voices to name"
-                        : "\(status.unknownSpeakers.count) unnamed voice(s)")
+                    + {
+                        let total = status.unknownSpeakers.count
+                        let actionable = status.unknownSpeakers.filter(\.isNameable).count
+                        if total == 0 { return "no voices to name" }
+                        if actionable == total { return "\(total) unnamed voice(s)" }
+                        // The difference is voices the server knows are
+                        // unnamed but has not finished clustering, which
+                        // cannot be named yet. Saying only the total made
+                        // the notification below look wrong when it
+                        // reported the actionable count.
+                        return "\(total) unnamed voice(s), \(actionable) nameable "
+                            + "so far"
+                    }()
                     + String(
                         format: ", %.0fs after it was queued",
                         Date().timeIntervalSince(item.enqueuedAt)))

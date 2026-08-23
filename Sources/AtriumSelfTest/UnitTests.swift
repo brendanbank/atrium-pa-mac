@@ -2275,6 +2275,24 @@ enum UnitTests {
 
         h.group("AudioEncoder — 48 kHz stereo master to 16 kHz mono AAC")
 
+        h.test("a measured rate is snapped to one a device really runs at") {
+            // Measured with AirPods: an aggregate reporting 48000 while
+            // delivering 16571 frames a second. Hands-free runs the link
+            // at 16 kHz; 16571 is that, sampled over a slightly wrong
+            // interval. Feeding the raw measurement into a resampler
+            // would bake a 3.6% error into every second.
+            try expectEqual(AudioRates.nearestStandard(to: 16571), 16000, "AirPods")
+            try expectEqual(AudioRates.nearestStandard(to: 47_950), 48000, "near 48k")
+            try expectEqual(AudioRates.nearestStandard(to: 24_100), 24000, "near 24k")
+            try expectEqual(AudioRates.nearestStandard(to: 44_050), 44100, "near 44.1k")
+
+            // Half way between two is still one of them, not the average.
+            let between = AudioRates.nearestStandard(to: 20_000)
+            try expect(
+                between == 16000 || between == 22050,
+                "snapping invented a rate: \(between)")
+        }
+
         h.test("drift is corrected; a stream that lost audio is not stretched") {
             // The distinction this number draws, from a 13-minute call
             // where the input device stopped 30 seconds early: an

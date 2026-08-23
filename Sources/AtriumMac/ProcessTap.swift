@@ -400,12 +400,61 @@ final class ProcessTap {
         let delivered = Double(framesProduced) / elapsed
         let ratio = delivered / tapRate
         guard ratio < 0.9 || ratio > 1.1 else { return }
+
+        // Believe the delivery, not the claim.
+        //
+        // Measured with AirPods: the aggregate reported 48000 while
+        // delivering 16571 — hands-free mode runs the link at 16 kHz and
+        // the aggregate keeps the rate it was created with. Written into
+        // a file that says 48000, that audio is a third of its true
+        // length and plays three times too fast.
+        //
+        // The device is asked again first, since it may simply have
+        // settled by now and an exact answer beats a measured one. Only
+        // if it still insists is the measurement used, snapped to a real
+        // rate — CoreAudio devices do not run at 16571 Hz, they run at
+        // 16000 and were sampled over a slightly wrong interval.
+        let reread = currentDeviceRate()
+        let corrected: Double
+        if let reread, abs(reread / delivered - 1) < 0.1 {
+            corrected = reread
+        } else {
+            corrected = AudioRates.nearestStandard(to: delivered)
+        }
+
         Log.write(
             String(
                 format: "tap: the aggregate claims %.0f Hz but is delivering %.0f — "
-                    + "the far end will be %.0f%% of its true length",
-                tapRate, delivered, ratio * 100))
+                    + "treating it as %.0f Hz%@",
+                tapRate, delivered, corrected,
+                reread.map { $0 == corrected ? " (the device now agrees)" : "" } ?? ""))
+
+        tapRate = corrected
+        rateAdapter =
+            corrected == outputRate ? nil : Resampler(from: corrected, to: outputRate)
+        if corrected != outputRate, rateAdapter == nil {
+            Log.write(
+                "tap: could not build a resampler from \(Int(corrected)) to "
+                    + "\(Int(outputRate)) Hz — the far end stays at the wrong speed")
+        }
     }
+
+    /// What the aggregate says its rate is, right now.
+    private func currentDeviceRate() -> Double? {
+        guard aggregateID != 0 else { return nil }
+        var format = AudioStreamBasicDescription()
+        var address = CA.address(
+            kAudioDevicePropertyStreamFormat, scope: kAudioObjectPropertyScopeOutput)
+        var size = UInt32(MemoryLayout<AudioStreamBasicDescription>.size)
+        guard
+            AudioObjectGetPropertyData(
+                aggregateID, &address, 0, nil, &size, &format) == noErr,
+            format.mSampleRate > 0
+        else { return nil }
+        return format.mSampleRate
+    }
+
+
 
     /// Rebuild if the tap has stopped delivering.
     ///

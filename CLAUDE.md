@@ -464,11 +464,57 @@ the mix runs as long as the *longer*, with silence where the other is
 missing. The log says which one, because it is not always the
 microphone.
 
-**The far-end tap has the microphone's old bug.** `ProcessTap` builds its
-aggregate device around the default *output* device UID, resolved once at
-`start()`. Change the output device mid-recording and the tap is wrapped
-around a device that is no longer playing the call — and unlike
-`MicCapture`, nothing yet notices or follows.
+## Following a device is three problems, not one
+
+Both captures now follow their device. Getting there found three things
+that only appear when you try it.
+
+**Watching the device property is not enough.** AirPods going away took
+the aggregate's sub-device with them and the far end stopped, while
+`kAudioHardwarePropertyDefaultOutputDevice` did not change for another
+**28 seconds**. So both streams are checked every two seconds for having
+gone *quiet*. That works for the far end precisely because the tap runs
+continuously whether or not anything is playing: silence means the stream
+is gone, not that the meeting paused.
+
+**Creating an aggregate re-fires the property you are listening to.** The
+first rebuild triggers the next — measured, ten in under two seconds,
+each costing far-end audio. `ProcessTap` compares the output device UID
+before acting, which is the guard `MicCapture` always had, plus a
+re-entrancy guard because the re-fire arrives while still inside the
+rebuild.
+
+**A rebuild can silence the microphone.** Creating an aggregate is the
+hardware reconfiguration that knocks over an input client — the
+documented reason the tap starts before the microphone. Mid-recording
+that hazard lands in the middle, so `MicCapture.restartIfStalled` exists
+and the recorder calls it after a rebuild.
+
+## A device that lies about its rate
+
+An aggregate reports the rate it had when it was created, and a Bluetooth
+link settles afterwards. Measured: the aggregate claimed **48000 while
+delivering 16571** — AirPods in hands-free mode run at 16 kHz. Written
+into a file that says 48000, that audio is a third of its true length and
+plays three times too fast.
+
+`checkDeliveredRate` compares the claim against the delivery three
+seconds in, and believes the delivery. It asks the device again first,
+since it may simply have settled and an exact answer beats a measured
+one; failing that it snaps the measurement to a rate devices really run
+at — `AudioRates.nearestStandard`, because nothing runs at 16571 Hz and
+resampling from that number would bake a 3.6% error into every second.
+
+Progression across four runs of the same switch, which is the honest
+measure of whether this converged:
+
+| | rebuilds | far end short by |
+|---|---|---|
+| nothing following | — | 61.4 s |
+| device property only | 1 | 61.4 s, noticed 28 s late |
+| + stall detection | 10 | 11.9 s |
+| + UID guard | 1 | 15.4 s |
+| + believing the delivered rate | 1 | *to be measured* |
 
 ## Two retention windows, because the two files are not worth the same
 

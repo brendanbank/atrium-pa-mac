@@ -122,6 +122,27 @@ final class MicCapture {
     // MARK: - State
 
     private var deviceID: AudioObjectID = 0
+
+    /// When the IOProc last delivered anything, and how much.
+    ///
+    /// A microphone that stops is silent in every sense: the callback
+    /// simply stops being called, no error is raised, and the recording
+    /// ends up short with nothing to say why. Measured on a 13-minute
+    /// call, the input stream ended 30 seconds before the far end and
+    /// the only trace was a frame count that did not add up.
+    private(set) var lastFrameSeconds: TimeInterval = 0
+
+    /// Seconds since the IOProc last delivered anything, or nil if it
+    /// never did.
+    var silentFor: TimeInterval? {
+        guard lastFrameSeconds > 0 else { return nil }
+        return ProcessInfo.processInfo.systemUptime - lastFrameSeconds
+    }
+    private var deviceListener: AudioObjectPropertyListenerBlock?
+
+    /// Set when the default input device changes while we are recording,
+    /// so the session log can say that is what happened.
+    private(set) var deviceChangedDuringCapture = false
     private var procID: AudioDeviceIOProcID?
     /// Mono at the device's own rate.
     private var ring: OpaquePointer?
@@ -270,6 +291,11 @@ final class MicCapture {
 
             if frames > 0 {
                 self.framesProduced += Int(arb_write(ring, scratch, frames))
+                // One store of a POD, no allocation and no lock: this
+                // runs on a CoreAudio realtime thread. It is the only
+                // way to tell "the microphone went quiet" from "the
+                // microphone stopped being called".
+                self.lastFrameSeconds = ProcessInfo.processInfo.systemUptime
             }
             if localPeak > self.peakAmplitude { self.peakAmplitude = localPeak }
         }
@@ -280,6 +306,7 @@ final class MicCapture {
         }
         procID = proc
 
+        watchForDeviceChange()
         let startStatus = AudioDeviceStart(device, proc)
         guard startStatus == noErr else {
             AudioDeviceDestroyIOProcID(device, proc)
@@ -295,8 +322,47 @@ final class MicCapture {
                 + "tcc \(Self.authorizationDescription)")
     }
 
+    /// Notice the default input device moving out from under us.
+    ///
+    /// The IOProc is bound to one device id, resolved once at `start()`.
+    /// When the default input changes — a call ending and a Bluetooth
+    /// headset leaving hands-free mode is the ordinary case — the old
+    /// device stops and the callback simply stops being called. Nothing
+    /// errors. The recording is short and silent about why.
+    ///
+    /// This does not re-bind mid-recording: tearing down an IOProc and
+    /// building another against a different device, at a different rate,
+    /// while a file is being written at the first rate, is a larger
+    /// change than the evidence yet justifies. What it does is make the
+    /// cause visible in the session log, so a short microphone stream
+    /// can be attributed rather than guessed at.
+    private func watchForDeviceChange() {
+        var address = CA.address(kAudioHardwarePropertyDefaultInputDevice)
+        let block: AudioObjectPropertyListenerBlock = { [weak self] _, _ in
+            guard let self, self.isRunning else { return }
+            self.deviceChangedDuringCapture = true
+            Log.write(
+                "mic: the default input device changed mid-recording — "
+                    + "the capture is still bound to device \(self.deviceID), "
+                    + "which may have stopped")
+        }
+        if AudioObjectAddPropertyListenerBlock(
+            AudioObjectID(kAudioObjectSystemObject), &address,
+            DispatchQueue.main, block) == noErr
+        {
+            deviceListener = block
+        }
+    }
+
     func stop() {
         guard isRunning else { return }
+        if let deviceListener {
+            var address = CA.address(kAudioHardwarePropertyDefaultInputDevice)
+            AudioObjectRemovePropertyListenerBlock(
+                AudioObjectID(kAudioObjectSystemObject), &address,
+                DispatchQueue.main, deviceListener)
+            self.deviceListener = nil
+        }
         if deviceID != 0, let procID {
             AudioDeviceStop(deviceID, procID)
             AudioDeviceDestroyIOProcID(deviceID, procID)

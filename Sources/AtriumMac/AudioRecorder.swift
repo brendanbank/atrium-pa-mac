@@ -66,11 +66,28 @@ final class AudioRecorder {
         var micFramesProduced = 0
         var micCallbacks = 0
 
+        /// Set when the default input device changed while recording.
+        /// The microphone's IOProc is bound to one device id, so a
+        /// change is the likeliest reason for a stream that ends early.
+        var inputDeviceChanged = false
+
+        /// How long the microphone had been delivering nothing when the
+        /// segment closed.
+        var micSilentForSeconds: TimeInterval?
+
         var micDuration: TimeInterval { Double(micFramesWritten) / micRate }
         var farDuration: TimeInterval { Double(farFramesWritten) / farRate }
 
         /// The longer of the two: what the meeting actually lasted.
         var duration: TimeInterval { max(micDuration, farDuration) }
+
+        /// Whether the microphone stopped well before the far end did.
+        ///
+        /// Not drift. A device that stops leaves a hole at the end, and
+        /// `AudioEncoder` refuses to stretch the audio to cover it — so
+        /// this is the number that says how much of the meeting has no
+        /// microphone in it.
+        var micShortfall: TimeInterval { max(0, farDuration - micDuration) }
 
         /// How far the two clocks disagreed, as a fraction. This is now
         /// an *observation* rather than something corrected live — the
@@ -89,6 +106,19 @@ final class AudioRecorder {
                 micDuration, micRate, farDuration, farRate, clockSkew * 100,
                 micOverruns, tapOverruns)
                 + " micFrames \(micFramesProduced) in \(micCallbacks) callbacks"
+                // Said plainly rather than left to be derived from two
+                // durations, because a short microphone stream is the
+                // one failure here that produces a usable-looking file
+                // with half the conversation missing.
+                + (micShortfall > 1
+                    ? String(
+                        format: " — MICROPHONE SHORT BY %.1fs%@%@", micShortfall,
+                        inputDeviceChanged
+                            ? " (the default input device changed mid-recording)" : "",
+                        micSilentForSeconds.map {
+                            String(format: ", silent for the last %.1fs", $0)
+                        } ?? "")
+                    : "")
         }
     }
 
@@ -320,6 +350,8 @@ final class AudioRecorder {
             stats.micOverruns = mic.overruns
             stats.micFramesProduced = mic.framesProduced
             stats.micCallbacks = mic.callbacks
+            stats.inputDeviceChanged = mic.deviceChangedDuringCapture
+            stats.micSilentForSeconds = mic.silentFor
             sidecar.interrupted = interrupted
             sidecar.write(stem: stem)
 

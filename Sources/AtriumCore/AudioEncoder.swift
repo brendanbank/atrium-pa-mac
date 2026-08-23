@@ -262,6 +262,15 @@ public enum AudioEncoder {
     ///
     /// Live, that same disagreement had to be guessed at continuously,
     /// and every guess was a splice.
+    /// The largest clock disagreement that is treated as drift.
+    ///
+    /// Real device clocks differ by parts per million;
+    /// `StreamAligner`'s tests simulate ±0.05%. Half a percent is an
+    /// order of magnitude above anything a crystal does and far below a
+    /// stream that lost audio, which is the distinction this number
+    /// exists to draw.
+    public static let maximumDriftCorrection = 0.005
+
     static func combine(micURL: URL, farURL: URL) throws -> [Float] {
         let mic = try? Stream(url: micURL)
         let far = try? Stream(url: farURL)
@@ -274,19 +283,59 @@ public enum AudioEncoder {
         let seconds = reference.duration
         guard seconds > 0 else { return [] }
 
+        // Reconciling the two lengths, and knowing when not to.
+        //
+        // Two clocks that ran for the same wall-clock time disagree
+        // slightly, and resampling the microphone from its *effective*
+        // rate — frames divided by the far end's duration — absorbs that
+        // exactly, with no silence inserted and no audio discarded.
+        //
+        // That is right for drift and catastrophic for loss. If the
+        // microphone stream simply *ends early*, its effective rate is
+        // not a clock measurement, it is the size of the hole; using it
+        // stretches the whole recording to cover a gap that exists in
+        // one place. Measured on a 13-minute call where the input device
+        // stopped 30 seconds before the end: an effective rate of 46260
+        // against a nominal 48000, slowing every word by 3.6% and
+        // dropping the pitch about 62 cents — for the entire recording,
+        // not for the missing part.
+        //
+        // So the correction is capped. Inside the cap it is drift and is
+        // absorbed; outside it, the nominal rate is used and the mix
+        // loop below leaves silence where the audio is missing. Silence
+        // in the right place beats speech in the wrong one — and the
+        // gap is at the end, which is where a device that stops leaves
+        // it.
+        let micNominal = mic?.rate
         let micEffective = mic.map { $0.effectiveRate(over: seconds) }
+        var micReadRate = micEffective
+
         if let mic, let micEffective, mic.rate > 0 {
+            let skew = micEffective / mic.rate - 1
+            let corrected = abs(skew) <= maximumDriftCorrection
+            if !corrected { micReadRate = micNominal }
             Log.write(
                 String(
                     format:
-                        "encode: mic %.2fs @%.0fHz (effective %.1f Hz, skew %+.3f%%), "
-                        + "far %.2fs @%.0fHz",
-                    mic.duration, mic.rate, micEffective,
-                    (micEffective / mic.rate - 1) * 100,
+                        "encode: mic %.2fs @%.0fHz (effective %.1f Hz, skew %+.3f%%) "
+                        + "%@, far %.2fs @%.0fHz",
+                    mic.duration, mic.rate, micEffective, skew * 100,
+                    corrected
+                        ? "— corrected as drift"
+                        : "— NOT corrected, too large for a clock; "
+                            + "padding the microphone with silence instead",
                     far?.duration ?? 0, far?.rate ?? 0))
+            if !corrected {
+                Log.write(
+                    String(
+                        format:
+                            "encode: %.1fs of microphone audio is missing from this "
+                            + "segment — the input device stopped before the far end did",
+                        seconds - mic.duration))
+            }
         }
 
-        let micSamples = try mic?.read(resampledTo: uploadSampleRate, from: micEffective)
+        let micSamples = try mic?.read(resampledTo: uploadSampleRate, from: micReadRate)
         let farSamples = try far?.read(resampledTo: uploadSampleRate, from: far?.rate)
 
         let mix = gains(

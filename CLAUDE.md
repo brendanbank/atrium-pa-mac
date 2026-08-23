@@ -361,6 +361,46 @@ Steady-state consequence worth knowing: correction only starts above
 channel sits ~100 ms behind the far-end. That is a constant, not a
 drift, and the file is downmixed to mono before upload anyway.
 
+## A microphone that stops is silent about stopping
+
+`MicCapture` resolves the default input device once at `start()` and
+binds its IOProc to that device id. When the default input changes
+mid-recording, the old device stops, the callback stops being called, and
+**nothing errors** — the recording just ends up short.
+
+Measured on a 13-minute WhatsApp call: far end 832.6 s against wall
+clock, microphone 802.4 s. Every callback delivered a full 480 frames, so
+there was no gap in the middle; the stream simply ended at 17:05:08,
+fourteen seconds after the other app released the microphone and thirty
+before the session did. The far-end tap was unaffected because it runs
+off the output side.
+
+**The encoder used to hide this.** `combine()` reconciles the two lengths
+by resampling the microphone from its *effective* rate — frames over the
+far end's duration — which absorbs genuine clock drift exactly. Applied
+to a stream that lost audio it stretches the whole recording to cover a
+hole in one place: 46260 Hz against a nominal 48000, slowing every word
+by 3.6% and dropping the pitch about 62 cents. It is also a plausible
+reason a voice matched its own print at only 66%.
+
+So `maximumDriftCorrection` caps it at 0.5% — an order of magnitude above
+any crystal, far below any loss. Inside the cap it is drift and is
+absorbed; outside it the nominal rate is used and the mix loop leaves
+silence where the audio is missing. Silence in the right place beats
+speech in the wrong one.
+
+Three things now say so out loud: the session line reports
+`MICROPHONE SHORT BY <n>s`, `MicCapture` logs when the default input
+device changes mid-recording, and it tracks how long the IOProc has been
+delivering nothing. None of that existed, which is why a 30-second hole
+had to be found by arithmetic on a frame count.
+
+**Not yet done:** re-binding to the new device mid-recording. Tearing
+down an IOProc and building another at a different rate while a file is
+open at the first rate is a bigger change than the evidence justifies —
+and it needs a real device switch to test against, which has happened
+exactly once.
+
 ## Two retention windows, because the two files are not worth the same
 
 The 48 kHz `.caf` masters are **41×** the size of the uploaded AAC —

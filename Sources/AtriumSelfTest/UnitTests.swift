@@ -2275,6 +2275,33 @@ enum UnitTests {
 
         h.group("AudioEncoder — 48 kHz stereo master to 16 kHz mono AAC")
 
+        h.test("drift is corrected; a stream that lost audio is not stretched") {
+            // The distinction this number draws, from a 13-minute call
+            // where the input device stopped 30 seconds early: an
+            // effective rate of 46260 against a nominal 48000 is not a
+            // clock, it is the size of a hole. Resampling from it slowed
+            // every word by 3.6% and dropped the pitch ~62 cents — for
+            // the whole recording, not for the missing part.
+            let cap = AudioEncoder.maximumDriftCorrection
+
+            // A real crystal. StreamAligner's own tests simulate ±0.05%.
+            try expect(0.0005 < cap, "0.05% drift must be absorbed, not padded")
+            try expect(0.002 < cap, "0.2% is still a plausible clock")
+
+            // The failure that prompted this.
+            let observed = 46260.3 / 48000 - 1
+            try expect(
+                abs(observed) > cap,
+                "3.6% must not be treated as drift, got a cap of \(cap)")
+
+            // And the cap sits far from both, rather than just above one.
+            try expect(
+                cap > 0.002 && cap < 0.01,
+                "the cap should separate clocks from losses with room either "
+                    + "side, got \(cap)")
+        }
+
+
         h.test("a synthesised master encodes to a mono 16 kHz m4a") {
             try withTemporaryRoot {
                 let master = try SyntheticAudio.writeStereoCAF(

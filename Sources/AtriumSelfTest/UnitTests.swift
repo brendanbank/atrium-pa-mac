@@ -2408,15 +2408,22 @@ enum UnitTests {
 
         h.test("a mic clock running fast is absorbed, not spliced") {
             try withTemporaryRoot {
-                // The case that produced the buzzing. The mic device is
-                // nominally 24 kHz but delivered 5% more frames than that
-                // over the same wall-clock time. Live, that was corrected
-                // by discarding audio 25 times a second. Offline it is
-                // one division: the file's own length says the clock
-                // really ran at 25.2 kHz, so it is resampled from there.
+                // The case that produced the buzzing. Live, a clock
+                // disagreement was corrected by discarding audio 25 times
+                // a second. Offline it is one division: the file's own
+                // length says what the clock really ran at, so it is
+                // resampled from there.
+                //
+                // The skew here is a *plausible* one. It used to be 5%,
+                // which made the effect vivid and is not a thing a
+                // crystal does — and once `maximumDriftCorrection`
+                // existed to tell drift from loss, 5% fell on the far
+                // side of it and the test was asserting the old
+                // behaviour.
+                let skew = AudioEncoder.maximumDriftCorrection * 0.6
                 let mic = try SyntheticAudio.writeMonoCAF(
                     to: AppPaths.recordings.appending(path: "skew.mic.caf"),
-                    rate: 24_000, frames: Int(24_000.0 * 4 * 1.05), hz: 300)
+                    rate: 24_000, frames: Int(24_000.0 * 4 * (1 + skew)), hz: 300)
                 let far = try SyntheticAudio.writeMonoCAF(
                     to: AppPaths.recordings.appending(path: "skew.far.caf"),
                     rate: 48_000, frames: 48_000 * 4, hz: 900)
@@ -2426,12 +2433,41 @@ enum UnitTests {
                 let seconds = Double(file.length) / file.fileFormat.sampleRate
                 h.note(
                     String(
-                        format: "mic +5%% fast, far 4.00s -> output %.2fs", seconds))
-                // The far end is the timebase, so the output tracks it
-                // rather than the stretched microphone.
-                try expectNear(seconds, 4, tolerance: 0.15, "duration follows the far end")
+                        format: "mic %+.2f%% fast, far 4.00s -> output %.3fs",
+                        skew * 100, seconds))
+                // Absorbed: the output tracks the far end rather than
+                // running long by the mic's surplus. The tolerance is
+                // tighter than the surplus itself, so an uncorrected
+                // stream would fail this.
+                try expectNear(
+                    seconds, 4, tolerance: 4 * skew * 0.5,
+                    "duration follows the far end")
                 try expect(
                     try SyntheticAudio.peak(of: uploaded) > 0.1, "output is silent")
+            }
+        }
+
+        h.test("a stream that stopped early does not truncate the other one") {
+            try withTemporaryRoot {
+                // Measured: a 38-second recording where the far-end tap
+                // died at 19 s. The far end is the timebase for drift,
+                // and using it as the *length* discarded 19 seconds of
+                // microphone — silently, into a file that looked
+                // complete.
+                let mic = try SyntheticAudio.writeMonoCAF(
+                    to: AppPaths.recordings.appending(path: "long.mic.caf"),
+                    rate: 24_000, frames: 24_000 * 8, hz: 300)
+                let far = try SyntheticAudio.writeMonoCAF(
+                    to: AppPaths.recordings.appending(path: "short.far.caf"),
+                    rate: 48_000, frames: 48_000 * 4, hz: 900)
+
+                let uploaded = try AudioEncoder.encodeForUpload(micURL: mic, farURL: far)
+                let file = try AVAudioFile(forReading: uploaded)
+                let seconds = Double(file.length) / file.fileFormat.sampleRate
+                h.note(String(format: "mic 8.00s, far 4.00s -> output %.2fs", seconds))
+                try expectNear(
+                    seconds, 8, tolerance: 0.1,
+                    "the mix was cut to the shorter stream, losing captured audio")
             }
         }
 

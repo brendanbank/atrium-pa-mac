@@ -423,6 +423,53 @@ mistake in miniature. The honest fix is to carry what the recorder knows
 through the sidecar to the encoder, instead of inferring it from two
 durations.
 
+## The log is for the pipeline, not for the window
+
+87% of the log file was once a single line — `activity: listing N
+recording(s)`, written every five seconds by the window's refresh timer,
+2447 times out of 2807. Meanwhile the upload path logged almost nothing:
+no request, no PUT, no state changes. The file recorded that a window was
+open and not that a meeting had been uploaded.
+
+Two rules that follow:
+
+* **A repeating check logs transitions, not answers.** The window logs
+  only when its summary changes; `poll` logs only when the pipeline's
+  state changes, not on each of the thirty-second polls that return the
+  same one.
+* **A diagnostic added to chase a bug becomes an alarm when the bug is
+  fixed.** The settings-pane geometry lines were a running commentary
+  while the layout was wrong; they now fire only when the content is
+  *not* where it should be.
+
+What the upload lane says now: queued with its size, the URL request,
+the capture id, bytes and throughput of the PUT, each pipeline
+transition, ready with its transcript id and how long the whole thing
+took, and every failure with its retry interval.
+
+## Neither stream is the length of the recording
+
+`combine` takes the far end as the timebase for *drift*, because its
+device runs continuously whether or not anything is playing. It used to
+take it as the **length** as well, and those are not the same thing.
+
+Measured: a 38-second recording whose far-end tap died at 19 seconds.
+Using the far end as the length discarded 19 seconds of microphone —
+silently, into a file that looked complete.
+
+So the length is the reference only when the disagreement was small
+enough to absorb as drift, in which case the microphone has been
+resampled to fit it anyway. Otherwise one of the two stopped early and
+the mix runs as long as the *longer*, with silence where the other is
+missing. The log says which one, because it is not always the
+microphone.
+
+**The far-end tap has the microphone's old bug.** `ProcessTap` builds its
+aggregate device around the default *output* device UID, resolved once at
+`start()`. Change the output device mid-recording and the tap is wrapped
+around a device that is no longer playing the call — and unlike
+`MicCapture`, nothing yet notices or follows.
+
 ## Two retention windows, because the two files are not worth the same
 
 The 48 kHz `.caf` masters are **41×** the size of the uploaded AAC —

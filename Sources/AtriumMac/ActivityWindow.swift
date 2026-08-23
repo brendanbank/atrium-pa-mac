@@ -37,6 +37,9 @@ final class ActivityWindow: NSWindow {
     private var retryButton = NSButton()
 
     private var items: [QueueItem] = []
+
+    /// What the last log line said, so an unchanged window stays quiet.
+    private var lastLoggedSummary = ""
     private var refreshTimer: Timer?
 
     /// Hooks back to the delegate, which owns the queue and the client.
@@ -115,10 +118,19 @@ final class ActivityWindow: NSWindow {
             self.emptyLabel.isHidden = !items.isEmpty
             self.updateAccount()
             self.updateButtons()
-            Log.write(
-                "activity: listing \(items.count) recording(s) — "
-                    + "\(self.accountLabel.stringValue.lowercased()), "
-                    + "start at login \(LoginItem.statusDescription)")
+            // Only when it changes. This reloads every five seconds
+            // while the window is open, and logging each pass made 87%
+            // of the log file one repeated sentence — burying the
+            // uploads, the state changes and the failures it exists to
+            // record.
+            let summary =
+                "\(items.count) recording(s) — "
+                + "\(self.accountLabel.stringValue.lowercased()), "
+                + "start at login \(LoginItem.statusDescription)"
+            if summary != self.lastLoggedSummary {
+                self.lastLoggedSummary = summary
+                Log.write("activity: \(summary)")
+            }
         }
     }
 

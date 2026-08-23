@@ -279,9 +279,15 @@ public enum AudioEncoder {
         // The far end is the timebase: its device runs continuously
         // whether or not anything is playing, so its length is the most
         // trustworthy measure of how long this segment lasted.
+        // The far end is the timebase for *drift*: its device runs
+        // continuously whether or not anything is playing, so its length
+        // is the most trustworthy measure of how long the segment
+        // lasted.
         let reference = far ?? mic!
-        let seconds = reference.duration
-        guard seconds > 0 else { return [] }
+        let referenceSeconds = reference.duration
+        guard referenceSeconds > 0 else { return [] }
+
+
 
         // Reconciling the two lengths, and knowing when not to.
         //
@@ -307,12 +313,14 @@ public enum AudioEncoder {
         // gap is at the end, which is where a device that stops leaves
         // it.
         let micNominal = mic?.rate
-        let micEffective = mic.map { $0.effectiveRate(over: seconds) }
+        let micEffective = mic.map { $0.effectiveRate(over: referenceSeconds) }
         var micReadRate = micEffective
+        var correctedAsDrift = true
 
         if let mic, let micEffective, mic.rate > 0 {
             let skew = micEffective / mic.rate - 1
             let corrected = abs(skew) <= maximumDriftCorrection
+            correctedAsDrift = corrected
             if !corrected { micReadRate = micNominal }
             Log.write(
                 String(
@@ -326,14 +334,36 @@ public enum AudioEncoder {
                             + "padding the microphone with silence instead",
                     far?.duration ?? 0, far?.rate ?? 0))
             if !corrected {
+                let micShort = referenceSeconds - mic.duration
                 Log.write(
-                    String(
-                        format:
-                            "encode: %.1fs of microphone audio is missing from this "
-                            + "segment — the input device stopped before the far end did",
-                        seconds - mic.duration))
+                    micShort > 0
+                        ? String(
+                            format:
+                                "encode: %.1fs of MICROPHONE audio is missing — the "
+                                + "input device stopped before the far end did",
+                            micShort)
+                        : String(
+                            format:
+                                "encode: %.1fs of FAR-END audio is missing — the "
+                                + "output device changed or the tap stopped. The "
+                                + "microphone is kept in full.",
+                            -micShort))
             }
         }
+
+        // How long the mix runs.
+        //
+        // When the disagreement was absorbed as drift the microphone has
+        // been resampled to fit, so the reference is the length. When it
+        // was not, one of the two stopped early and the mix is as long
+        // as the *longer* — truncating to the shorter one throws away
+        // audio that was captured. Measured: a 38-second recording whose
+        // far-end tap died at 19 s, where using the far end as the
+        // length discarded 19 seconds of microphone, silently, into a
+        // file that looked complete.
+        let seconds =
+            correctedAsDrift
+            ? referenceSeconds : max(referenceSeconds, mic?.duration ?? 0)
 
         let micSamples = try mic?.read(resampledTo: uploadSampleRate, from: micReadRate)
         let farSamples = try far?.read(resampledTo: uploadSampleRate, from: far?.rate)

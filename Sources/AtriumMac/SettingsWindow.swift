@@ -183,13 +183,17 @@ final class SettingsTabs: NSTabViewController {
         frame.size.width = max(frame.width, wanted.width)
         frame.origin.y = top - frame.height
         window.setFrame(frame, display: true, animate: false)
-        // The content height that resulted, against what the pane asked
-        // for. This window has been the wrong size three times; a number
-        // is cheaper than another screenshot.
-        Log.write(
-            String(
-                format: "settings: fitted to %.0f content for a pane wanting %.0f",
-                window.contentLayoutRect.height, wanted.height))
+        // Only when the window could not be given what the pane asked
+        // for, which is the failure that hides a control below the
+        // bottom edge.
+        let got = window.contentLayoutRect.height
+        if got + 1 < wanted.height {
+            Log.write(
+                String(
+                    format: "settings: window is %.0f tall for a pane wanting %.0f "
+                        + "— something is below the bottom edge",
+                    got, wanted.height))
+        }
     }
 }
 
@@ -303,14 +307,17 @@ class BasePane: NSViewController, SettingsPane {
         view.layoutSubtreeIfNeeded()
         preferredContentSize = NSSize(
             width: Self.paneWidth, height: max(stack.fittingSize.height + 48, 160))
-        // Where the content actually ended up. The bug this replaces put
-        // every control at the bottom of the window with a screen of
-        // blank above it, and the only way to see that from here is to
-        // say where the stack sits inside the pane.
-        Log.write(
-            "settings: \(String(describing: type(of: self))) content at "
-                + "y \(Int(stack.frame.minY))…\(Int(stack.frame.maxY)) "
-                + "of \(Int(view.frame.height)), width \(Int(stack.frame.width))")
+        // Only when it looks wrong. This was a running commentary while
+        // the pane layout was being fixed; now that it is, a line per
+        // tab switch is noise. The condition is the bug it was written
+        // for — content that does not start at the top of the pane.
+        let topInset = view.frame.height - stack.frame.maxY
+        if topInset > 40 || stack.frame.width < 100 {
+            Log.write(
+                "settings: \(String(describing: type(of: self))) content looks "
+                    + "misplaced — \(Int(topInset))pt from the top, "
+                    + "\(Int(stack.frame.width))pt wide")
+        }
     }
 
     /// Subclasses add rows here.

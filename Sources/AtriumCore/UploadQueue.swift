@@ -472,6 +472,10 @@ public actor UploadQueue {
     /// captures costs one request each and saves a schema field.
     private var lastSpeakerCheck: [UUID: Date] = [:]
 
+    /// The last pipeline state reported per item, so a poll every 30
+    /// seconds logs transitions rather than repetitions.
+    private var lastReportedStatus: [UUID: String] = [:]
+
     /// Once per launch. See `backfillRosters`.
     private var didBackfillRosters = false
 
@@ -641,6 +645,19 @@ public actor UploadQueue {
         }
     }
 
+    /// Bytes as something a person can read.
+    static func readableSize(_ bytes: Int) -> String {
+        let units = ["B", "KB", "MB", "GB"]
+        var value = Double(bytes)
+        var unit = 0
+        while value >= 1024, unit < units.count - 1 {
+            value /= 1024
+            unit += 1
+        }
+        return String(format: value < 10 && unit > 0 ? "%.1f %@" : "%.0f %@",
+                      value, units[unit])
+    }
+
     /// Delete a recording from this machine.
     ///
     /// The audio, the masters and the queue entry — everything this app
@@ -788,12 +805,20 @@ public actor UploadQueue {
             return
         }
 
+        Log.write(
+            "upload: asking for a URL for \(item.audioFile) "
+                + "(\(Self.readableSize(item.sizeBytes)), “\(item.title ?? "untitled")”)"
+                + (item.attempts > 0 ? " — attempt \(item.attempts + 1)" : ""))
+
         let ticket = try await client.requestUpload(
             filename: item.audioFile,
             sizeBytes: item.sizeBytes,
             title: item.title,
             occurredAt: item.occurredAt,
             language: item.language)
+        Log.write(
+            "upload: capture \(ticket.captureID) reserved, URL good for "
+                + "\(ticket.expiresIn)s")
 
         // Persisted before the PUT: a crash during the transfer must
         // leave something we can ask about rather than a capture we
@@ -802,7 +827,15 @@ public actor UploadQueue {
         items[item.id] = item
         persist(item)
 
+        let started = Date()
         try await client.putAudio(fileURL: item.audioURL, to: ticket.uploadURL)
+        let seconds = Date().timeIntervalSince(started)
+        Log.write(
+            String(
+                format: "upload: capture %d sent %@ in %.1fs (%@/s)",
+                ticket.captureID, Self.readableSize(item.sizeBytes), seconds,
+                Self.readableSize(Int(Double(item.sizeBytes) / max(seconds, 0.001)))))
+
         item.state = .uploaded
         item.nextAttemptAt = Date().addingTimeInterval(pollInterval)
     }
@@ -815,6 +848,18 @@ public actor UploadQueue {
         }
 
         let status = try await client.uploadStatus(captureID: captureID)
+
+        // Only when it moves. Polling every 30 seconds and logging each
+        // answer would bury the transitions in repetitions of the same
+        // one, which is exactly what the activity window used to do to
+        // this file.
+        if status.status != lastReportedStatus[item.id] {
+            lastReportedStatus[item.id] = status.status
+            Log.write(
+                "pipeline: capture \(captureID) is \(status.status)"
+                    + (status.detail.map { " — \($0)" } ?? ""))
+        }
+
         switch status.status {
         case "ready":
             item.state = .ready
@@ -822,16 +867,26 @@ public actor UploadQueue {
             item.completedAt = Date()
             item.nextAttemptAt = .distantFuture
             item.unknownSpeakers = status.unknownSpeakers
-            if !status.unknownSpeakers.isEmpty {
-                Log.write(
-                    "capture \(item.captureID ?? 0): \(status.unknownSpeakers.count) "
-                        + "unnamed voice(s)")
-            }
+            Log.write(
+                "pipeline: capture \(captureID) ready — transcript "
+                    + "\(status.transcriptID.map(String.init) ?? "?"), "
+                    + (status.unknownSpeakers.isEmpty
+                        ? "no voices to name"
+                        : "\(status.unknownSpeakers.count) unnamed voice(s)")
+                    + String(
+                        format: ", %.0fs after it was queued",
+                        Date().timeIntervalSince(item.enqueuedAt)))
             onReady?(item)
         case "failed":
             item.state = .failed
             item.lastError = status.detail ?? "the pipeline reported a failure"
+            Log.write(
+                "pipeline: capture \(captureID) FAILED — \(item.lastError ?? "")"
+                    + ". The audio stays on disk.")
         case "awaiting_upload":
+            Log.write(
+                "pipeline: capture \(captureID) never received the bytes — "
+                    + "starting again with a fresh URL")
             // The bytes never landed, or the reservation outlived them.
             // Start over with a fresh URL — never re-PUT the old one.
             item.state = .pending
@@ -849,6 +904,9 @@ public actor UploadQueue {
         item.attempts += 1
         guard retryable else {
             item.state = .failed
+            Log.write(
+                "upload: \(item.audioFile) gave up after \(item.attempts) attempt(s) "
+                    + "— \(error). The audio stays on disk.")
             return
         }
         // Exponential, capped at an hour, with jitter so a queue of
@@ -856,6 +914,10 @@ public actor UploadQueue {
         let backoff = min(60 * pow(2, Double(item.attempts - 1)), 3600)
         item.nextAttemptAt = Date().addingTimeInterval(
             backoff + Double.random(in: 0...min(backoff * 0.2, 60)))
+        Log.write(
+            String(
+                format: "upload: %@ failed (attempt %d) — %@. Trying again in ~%.0fs.",
+                item.audioFile, item.attempts, error, backoff))
     }
 
     private func recordGlobal(error: String) {

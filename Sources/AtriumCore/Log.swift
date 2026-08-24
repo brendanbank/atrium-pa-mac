@@ -15,13 +15,27 @@ import Foundation
 /// why an upload failed at 3am.
 public enum Log {
 
+    /// Where the self-test sends its output, for the whole run.
+    ///
+    /// Following `AppPaths.rootOverride` alone was not enough, and the
+    /// gap cost an afternoon. That override is scoped to the tests that
+    /// ask for a temporary tree; every other test left it `nil`, so
+    /// their output went to the real file. The result was 130 lines
+    /// reading `no far-end audio within 0s` sitting among genuine
+    /// sessions — fixtures, from a suite that tunes the window to 0.15 s
+    /// to stay fast, and `Int(0.15)` is `0`. A healthy app was diagnosed
+    /// as broken from its own log.
+    ///
+    /// So the log's destination is now decided separately from where
+    /// config lives. They are different questions: a live test needs the
+    /// real credentials *and* must not write to the real log, which one
+    /// switch cannot express.
+    public static var fileURLOverride: URL?
+
     public static var fileURL: URL {
-        // Follows `AppPaths.rootOverride`, so the self-test writes into
-        // its own temporary directory. It used to write here regardless,
-        // which put synthetic events — Teams sessions that never
-        // happened, discards with a 0-second window — into the log next
-        // to real ones, and made the log actively misleading at exactly
-        // the moment someone was reading it to diagnose a real meeting.
+        if let fileURLOverride { return fileURLOverride }
+        // Also follows `AppPaths.rootOverride`, so a test that redirects
+        // the whole tree gets a log inside it.
         if let root = AppPaths.rootOverride {
             return root.appending(path: "AtriumMac.log")
         }

@@ -7,6 +7,17 @@ public struct SessionPolicy {
 
     public init() {}
 
+    /// A window as it actually is, not truncated to whole seconds.
+    ///
+    /// `Int(0.15)` is `0`, so a test window of 0.15 s printed as "within
+    /// 0s" — which reads exactly like a misconfigured app, and was
+    /// diagnosed as one.
+    static func describe(_ seconds: TimeInterval) -> String {
+        seconds < 1
+            ? String(format: "%.2fs", seconds)
+            : "\(Int(seconds))s"
+    }
+
     /// How long the mic must stay released before a meeting is over.
     /// Teams and Zoom both hold the input device open well past the end
     /// of a call, and Zoom keeps it running while you are muted, so the
@@ -121,10 +132,11 @@ public final class SessionController {
         // older than the source. A configured value that is only ever
         // seen through its consequences is a value nobody can check.
         Log.write(
-            "sessions: far-end window \(Int(policy.farEndConfirmationWindow))s, "
-                + "end debounce \(Int(policy.endDebounce))s, "
-                + "merge \(Int(policy.mergeWindow))s, "
-                + "minimum \(Int(policy.minimumDuration))s")
+            "sessions: far-end window "
+                + SessionPolicy.describe(policy.farEndConfirmationWindow)
+                + ", end debounce " + SessionPolicy.describe(policy.endDebounce)
+                + ", merge " + SessionPolicy.describe(policy.mergeWindow)
+                + ", minimum " + SessionPolicy.describe(policy.minimumDuration))
     }
 
     /// Feed a mic event in. Safe to call from any thread.
@@ -306,8 +318,11 @@ public final class SessionController {
                 return
             }
             let holder = session.bundleID
-            self.discard(session, reason: "no far-end audio within "
-                + "\(Int(self.policy.farEndConfirmationWindow))s — not a call")
+            self.discard(
+                session,
+                reason: "no far-end audio within "
+                    + SessionPolicy.describe(self.policy.farEndConfirmationWindow)
+                    + " — not a call")
 
             // Still holding the microphone? Then this is not "not a
             // call" — it is "not a call *yet*", and giving up for good

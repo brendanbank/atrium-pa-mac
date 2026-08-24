@@ -122,6 +122,24 @@ if let index = arguments.firstIndex(of: "--identify"), arguments.count > index +
 
 let harness = Harness()
 
+// Nothing from here on may touch `~/Library/Logs/AtriumMac.log`.
+//
+// This app has no stderr — it is only ever launched through
+// LaunchServices — so that file is the whole diagnostic surface, and a
+// line in it is read as something that happened. Fixture output sitting
+// next to real sessions does not merely add noise; it invites a wrong
+// diagnosis, and once did.
+let productionLog = FileManager.default
+    .urls(for: .libraryDirectory, in: .userDomainMask)[0]
+    .appending(path: "Logs/AtriumMac.log")
+let productionLogBefore = try? FileManager.default
+    .attributesOfItem(atPath: productionLog.path)[.modificationDate] as? Date
+
+let testLogRoot = FileManager.default.temporaryDirectory
+    .appending(path: "atrium-selftest-logs-\(UUID().uuidString)")
+try? FileManager.default.createDirectory(at: testLogRoot, withIntermediateDirectories: true)
+Log.fileURLOverride = testLogRoot.appending(path: "AtriumMac.log")
+
 print("atrium-mac self test")
 
 if !onlyLive {
@@ -136,5 +154,20 @@ if wantsLive {
         "\u{001B}[2mLive upload tests skipped. Run `make test-live` to exercise "
             + "the real ingest lane.\u{001B}[0m")
 }
+
+// The guard, not just the redirect. A redirect that silently lapses is
+// how this got shipped in the first place, so the run fails if the real
+// log was touched at all.
+let productionLogAfter = try? FileManager.default
+    .attributesOfItem(atPath: productionLog.path)[.modificationDate] as? Date
+if productionLogBefore != productionLogAfter {
+    print("")
+    print(
+        "\u{001B}[31mFAIL\u{001B}[0m  the self-test wrote to "
+            + "~/Library/Logs/AtriumMac.log — fixture output would be read as "
+            + "something that happened")
+    exit(1)
+}
+try? FileManager.default.removeItem(at: testLogRoot)
 
 exit(harness.summarise())

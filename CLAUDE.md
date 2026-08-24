@@ -807,6 +807,22 @@ them.
 
 ## Handing it to somebody else
 
+**The build is universal**, so it runs on Intel Macs as well as Apple
+Silicon. They run macOS well past this app's 14.2 floor, and an
+arm64-only build refuses to launch on them saying nothing useful; the
+cost of including them is about 1.8 MB. `make ARCHS=arm64` builds only
+for this machine when iterating.
+
+One trap that is guarded rather than remembered: a multi-arch build does
+**not** populate `.build/release/`. That path stays single-arch, so the
+hardcoded `BIN` bundled an arm64-only binary out of a universal build
+and said nothing — measured, `lipo -archs .build/release/AtriumMac`
+still reported `arm64` after `swift build --arch arm64 --arch x86_64`.
+`BIN` now asks SwiftPM with `--show-bin-path`, and `bundle` refuses
+outright if the binary it copied is missing an architecture that was
+asked for. **Intel is untested** — there is no Intel Mac here — so it is
+built, signed and notarized for x86_64 but never run on it.
+
 `make dmg` writes `build/Atrium PA Capture <version>.dmg` containing the
 app and a symlink to `/Applications` — the drag-and-drop install every
 Mac user already knows. `hdiutil` and `ln` do all of it: no `create-dmg`,

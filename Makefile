@@ -8,7 +8,26 @@ APP_NAME    := AtriumMac
 BUNDLE_NAME := Atrium PA Capture
 BUNDLE      := build/$(BUNDLE_NAME).app
 CONFIG      := release
-BIN         := .build/$(CONFIG)/$(APP_NAME)
+
+# Universal, so this runs on Intel Macs as well as Apple Silicon.
+#
+# Intel Macs run macOS well past this app's 14.2 floor, and an arm64-only
+# build refuses to launch on them with a message that explains nothing.
+# The cost is about 1.8 MB of binary.
+#
+# Override to build only for this machine, which is faster:
+#   make ARCHS=arm64
+ARCHS       ?= arm64 x86_64
+ARCH_FLAGS  := $(foreach a,$(ARCHS),--arch $(a))
+
+# Asked for rather than assumed. A multi-arch build does NOT populate
+# .build/$(CONFIG)/ — that path stays single-arch, so hardcoding it
+# bundles an arm64-only binary from a universal build and says nothing.
+# Measured: after `swift build --arch arm64 --arch x86_64`,
+# `lipo -archs .build/release/AtriumMac` still reported just `arm64`.
+# Deferred (`=`, not `:=`) so it is resolved when used, not on every
+# `make clean`.
+BIN          = $(shell swift build -c $(CONFIG) $(ARCH_FLAGS) --show-bin-path)/$(APP_NAME)
 
 # Signing identity.
 #
@@ -90,17 +109,24 @@ NOTARY_PROFILE ?= atrium-notary
 all: bundle
 
 build:
-	swift build -c $(CONFIG)
+	swift build -c $(CONFIG) $(ARCH_FLAGS)
 
 bundle: build
 	@rm -rf "$(BUNDLE)"
 	@mkdir -p "$(BUNDLE)/Contents/MacOS" "$(BUNDLE)/Contents/Resources"
 	@cp "$(BIN)" "$(BUNDLE)/Contents/MacOS/$(APP_NAME)"
+	@for a in $(ARCHS); do \
+		lipo -archs "$(BUNDLE)/Contents/MacOS/$(APP_NAME)" | grep -qw $$a || { \
+			echo "the bundled binary is missing $$a"; \
+			echo "   has: $$(lipo -archs "$(BUNDLE)/Contents/MacOS/$(APP_NAME)")"; \
+			exit 1; \
+		}; \
+	done
 	@cp Resources/Info.plist "$(BUNDLE)/Contents/Info.plist"
 	@cp Resources/AppIcon.icns "$(BUNDLE)/Contents/Resources/AppIcon.icns"
 	@printf 'APPL????' > "$(BUNDLE)/Contents/PkgInfo"
 	@$(MAKE) --no-print-directory sign
-	@echo "built $(BUNDLE)"
+	@echo "built $(BUNDLE) [$$(lipo -archs "$(BUNDLE)/Contents/MacOS/$(APP_NAME)")]"
 
 sign:
 	@codesign --force --sign "$(CODESIGN_IDENTITY)" $(TIMESTAMP) $(SIGN_FLAGS) "$(BUNDLE)"

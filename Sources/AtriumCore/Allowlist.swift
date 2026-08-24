@@ -25,11 +25,33 @@ public struct Allowlist: Codable, Equatable {
         self.prefixes = prefixes
     }
 
+    /// ## FaceTime needs two entries, and the useful one is a daemon
+    ///
+    /// `com.apple.FaceTime` is the app you quit to end a call, but the
+    /// microphone is held by **`com.apple.avconferenced`** — the AV
+    /// conference daemon every Apple call goes through. Listing only the
+    /// app matches nothing, exactly as an exact-match list on
+    /// `com.microsoft.teams2` would.
+    ///
+    /// `avconferenced` is shared rather than per-app, so it can hold the
+    /// input device for things that are not a FaceTime call. That is the
+    /// same shape as `com.google.Chrome.helper`, and it is handled the
+    /// same way rather than by trying to be cleverer: record
+    /// speculatively and let `SessionPolicy.farEndConfirmationWindow`
+    /// throw the session away if no far-end audio arrives. A call has
+    /// two-way audio; a daemon idling does not.
+    ///
+    /// Deliberately **not** included: `com.apple.TelephonyUtilities`
+    /// (`callservicesd`), which carries iPhone calls relayed to the Mac.
+    /// That is a different feature rather than an oversight — add it if
+    /// you want phone calls recorded too.
     public static let defaults = Allowlist(prefixes: [
         "com.microsoft.teams2",   // Teams (+ .helper, .modulehost)
         "com.google.Chrome",      // Meet in Chrome (+ .helper)
         "us.zoom.xos",            // Zoom
         "net.whatsapp.WhatsApp",  // WhatsApp (+ .ServiceExtension)
+        "com.apple.FaceTime",     // FaceTime, though see avconferenced
+        "com.apple.avconferenced",  // ...which is what actually holds it
     ])
 
     public func matches(bundleID: String?) -> Bool {

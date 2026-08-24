@@ -659,6 +659,25 @@ enum UnitTests {
             try expectEqual(session?.farEndConfirmed, false, "far-end pre-confirmed")
         }
 
+        h.test("FaceTime is recognised by the daemon that holds the mic") {
+            // `com.apple.FaceTime` is the app you quit to end a call;
+            // `com.apple.avconferenced` is what actually takes the input
+            // device. An allowlist carrying only the app matches nothing
+            // — the same failure an exact-match list has against
+            // `com.microsoft.teams2.helper`.
+            try expect(
+                Allowlist.defaults.matches(bundleID: "com.apple.avconferenced"),
+                "avconferenced is not matched, so FaceTime records nothing")
+            try expect(
+                Allowlist.defaults.matches(bundleID: "com.apple.FaceTime"),
+                "FaceTime itself is not matched")
+            // Relayed iPhone calls are a different feature, left out on
+            // purpose rather than forgotten.
+            try expect(
+                !Allowlist.defaults.matches(bundleID: "com.apple.TelephonyUtilities"),
+                "callservicesd matched — phone calls would record unasked")
+        }
+
         h.test("a session with no far-end audio is discarded, not kept") {
             var policy = SessionPolicy()
             policy.farEndConfirmationWindow = 0.15

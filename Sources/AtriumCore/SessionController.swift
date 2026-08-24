@@ -113,6 +113,18 @@ public final class SessionController {
     public init(policy: SessionPolicy = SessionPolicy(), allowlist: @escaping () -> Allowlist) {
         self.policy = policy
         self.allowlist = allowlist
+        // The window values, once, from the running binary.
+        //
+        // Every far-end discard in the log reported a 0-second window
+        // while the source said 60, and there was no way to tell whether
+        // the policy was wrong, the message was wrong, or the binary was
+        // older than the source. A configured value that is only ever
+        // seen through its consequences is a value nobody can check.
+        Log.write(
+            "sessions: far-end window \(Int(policy.farEndConfirmationWindow))s, "
+                + "end debounce \(Int(policy.endDebounce))s, "
+                + "merge \(Int(policy.mergeWindow))s, "
+                + "minimum \(Int(policy.minimumDuration))s")
     }
 
     /// Feed a mic event in. Safe to call from any thread.

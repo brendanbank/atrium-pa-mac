@@ -183,4 +183,4 @@ from a problem with the machine — see `CLAUDE.md`.
 
 ## Licence
 
-BSD-2-Clause
+BSD-2-Clause — see [LICENSE](LICENSE).

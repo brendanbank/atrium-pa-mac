@@ -633,6 +633,94 @@ enum UnitTests {
     // MARK: - SessionController
 
     private static func sessions(_ h: Harness) {
+        h.group("QueueFilter — finding one meeting among hundreds")
+
+        func queued(
+            title: String? = nil, state: QueueItem.State = .ready,
+            when: Date = Date(timeIntervalSince1970: 1_787_500_000),
+            unknown: [MCPClient.UnknownSpeaker] = [],
+            speakers: [String] = []
+        ) -> QueueItem {
+            QueueItem(
+                id: UUID(), audioFile: "a.m4a", masterFiles: [], title: title,
+                occurredAt: when, language: nil, sizeBytes: 1, state: state,
+                captureID: 1, transcriptID: nil, attempts: 0,
+                nextAttemptAt: .distantPast, lastError: nil, enqueuedAt: when,
+                completedAt: nil, unknownSpeakers: unknown, notifiedAt: nil,
+                namedSpeakers: speakers, knownSpeakers: [])
+        }
+
+        h.test("an empty filter changes nothing") {
+            let items = [queued(title: "Standup"), queued(title: "Retro")]
+            try expectEqual(QueueFilter().apply(to: items).count, 2, "items kept")
+            try expect(!QueueFilter().isNarrowing, "an empty filter claimed to narrow")
+        }
+
+        h.test("a search matches the title, ignoring case and accents") {
+            let items = [queued(title: "Café planning"), queued(title: "Retro")]
+            try expectEqual(
+                QueueFilter(text: "cafe").apply(to: items).first?.title,
+                "Café planning", "accent or case stopped the match")
+        }
+
+        h.test("a search matches the date as the window displays it") {
+            // Somebody types what they saw in the column — "d MMM" —
+            // not an ISO timestamp. Matching the rendered form is what
+            // makes the obvious query work.
+            let items = [queued(title: "Standup")]
+            let shown = DateFormatter()
+            shown.dateFormat = "MMM"
+            let month = shown.string(from: Date(timeIntervalSince1970: 1_787_500_000))
+            try expectEqual(
+                QueueFilter(text: month).apply(to: items).count, 1,
+                "searching the month shown in the window found nothing")
+        }
+
+        h.test("a search matches a speaker's name") {
+            // Often the only thing anyone remembers about a meeting.
+            let items = [
+                queued(title: "Standup", speakers: ["Alex Rivera"]),
+                queued(title: "Retro", speakers: ["Sam Okafor"]),
+            ]
+            try expectEqual(
+                QueueFilter(text: "rivera").apply(to: items).first?.title, "Standup",
+                "a speaker's name did not find their meeting")
+        }
+
+        h.test("failed is the scope that can still be rescued") {
+            let items = [
+                queued(title: "Broken", state: .failed),
+                queued(title: "Fine", state: .ready),
+            ]
+            try expectEqual(
+                QueueFilter(scope: .failed).apply(to: items).first?.title, "Broken",
+                "the failed scope did not isolate the failure")
+        }
+
+        h.test("in progress means not finished, either half of it") {
+            let items = [
+                queued(title: "Sending", state: .pending),
+                queued(title: "Waiting", state: .uploaded),
+                queued(title: "Done", state: .ready),
+                queued(title: "Broken", state: .failed),
+            ]
+            let found = QueueFilter(scope: .inProgress).apply(to: items).map(\.title)
+            try expectEqual(found.count, 2, "in-progress scope size")
+            try expect(found.contains("Sending"), "pending missing from in progress")
+            try expect(found.contains("Waiting"), "uploaded missing from in progress")
+        }
+
+        h.test("scope and text narrow together, not separately") {
+            let items = [
+                queued(title: "Standup", state: .failed),
+                queued(title: "Standup", state: .ready),
+                queued(title: "Retro", state: .failed),
+            ]
+            let found = QueueFilter(scope: .failed, text: "standup").apply(to: items)
+            try expectEqual(found.count, 1, "scope and text did not combine")
+            try expectEqual(found.first?.state, .failed, "wrong item survived")
+        }
+
         h.group("PersonMatch — not creating somebody twice")
 
         func person(_ id: Int, _ name: String) -> MCPClient.Person {

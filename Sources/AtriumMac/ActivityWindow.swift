@@ -36,7 +36,18 @@ final class ActivityWindow: NSWindow {
     private var openButton = NSButton()
     private var retryButton = NSButton()
 
+    private let search = NSSearchField()
+    private let scopeMenu = NSPopUpButton()
+    private let countLabel = NSTextField(labelWithString: "")
+
+    /// Everything the queue has, and the subset on screen.
+    ///
+    /// Kept apart so the five-second refresh can replace the data
+    /// without discarding what the person narrowed it to. Merging them
+    /// would mean a search box that empties itself while being typed in.
+    private var allItems: [QueueItem] = []
     private var items: [QueueItem] = []
+    private var filter = QueueFilter()
 
     /// What the last log line said, so an unchanged window stays quiet.
     private var lastLoggedSummary = ""
@@ -108,14 +119,15 @@ final class ActivityWindow: NSWindow {
             // selection — so a row selected and then thought about for
             // a moment deselected itself under the pointer.
             let selectedID = self.selected?.id
-            self.items = items
+            self.allItems = items
+            self.items = self.filter.apply(to: items)
             self.table.reloadData()
             if let selectedID,
-                let row = items.firstIndex(where: { $0.id == selectedID })
+                let row = self.items.firstIndex(where: { $0.id == selectedID })
             {
                 self.table.selectRowIndexes([row], byExtendingSelection: false)
             }
-            self.emptyLabel.isHidden = !items.isEmpty
+            self.updateEmptyState()
             self.updateAccount()
             self.updateButtons()
             // Only when it changes. This reloads every five seconds
@@ -132,6 +144,53 @@ final class ActivityWindow: NSWindow {
                 Log.write("activity: \(summary)")
             }
         }
+    }
+
+    /// Re-narrow without going back to the queue.
+    ///
+    /// Typing is not a reason to re-read anything: `allItems` is already
+    /// in hand, and a round trip per keystroke would make the field feel
+    /// like it was lagging behind the keyboard.
+    private func applyFilter() {
+        let selectedID = selected?.id
+        items = filter.apply(to: allItems)
+        table.reloadData()
+        if let selectedID, let row = items.firstIndex(where: { $0.id == selectedID }) {
+            table.selectRowIndexes([row], byExtendingSelection: false)
+        }
+        updateEmptyState()
+        updateButtons()
+    }
+
+    /// "No recordings" and "nothing matches" are different answers.
+    ///
+    /// Showing the first when the second is true reads as data loss —
+    /// the list somebody has been keeping for a year looks empty because
+    /// a word is still sitting in the search box.
+    private func updateEmptyState() {
+        emptyLabel.isHidden = !items.isEmpty
+        emptyLabel.stringValue =
+            filter.isNarrowing
+            ? "No recordings match. Clear the search, or choose All."
+            : "No recordings yet. Press the green triangle to record, or join a "
+                + "meeting in an app on the allowlist."
+
+        // The count is only interesting while it is not the whole list.
+        countLabel.stringValue =
+            filter.isNarrowing && !allItems.isEmpty
+            ? "\(items.count) of \(allItems.count)" : ""
+    }
+
+    @objc private func searchChanged() {
+        filter.text = search.stringValue
+        applyFilter()
+    }
+
+    @objc private func scopeChanged() {
+        let scopes = QueueFilter.Scope.allCases
+        let index = scopeMenu.indexOfSelectedItem
+        filter.scope = scopes.indices.contains(index) ? scopes[index] : .all
+        applyFilter()
     }
 
     private var selected: QueueItem? {
@@ -356,7 +415,39 @@ final class ActivityWindow: NSWindow {
         accountButton.autoresizingMask = [.minXMargin, .minYMargin]
         view.addSubview(accountButton)
 
-        scroll.frame = NSRect(x: 0, y: 52, width: 720, height: 322)
+        // The filter row, between the account line and the table.
+        //
+        // A year of daily meetings is around 500 rows. Reading every one
+        // to find the meeting that failed is the thing that stops
+        // working, not the loading — measured, a queue item is ~1250
+        // bytes and the whole year is 0.6 MB read once at launch.
+        scopeMenu.frame = NSRect(x: 16, y: 344, width: 150, height: 26)
+        scopeMenu.addItems(withTitles: QueueFilter.Scope.allCases.map(\.label))
+        scopeMenu.target = self
+        scopeMenu.action = #selector(scopeChanged)
+        scopeMenu.autoresizingMask = [.minYMargin]
+        view.addSubview(scopeMenu)
+
+        search.frame = NSRect(x: 174, y: 345, width: 424, height: 24)
+        search.placeholderString = "Search meetings, dates and speakers"
+        search.target = self
+        // Fires per keystroke rather than on Enter. A search box that
+        // waits for Return is the same shape as the server field that
+        // silently kept nothing when a button was clicked instead.
+        search.action = #selector(searchChanged)
+        (search.cell as? NSSearchFieldCell)?.sendsWholeSearchString = false
+        (search.cell as? NSSearchFieldCell)?.sendsSearchStringImmediately = true
+        search.autoresizingMask = [.width, .minYMargin]
+        view.addSubview(search)
+
+        countLabel.frame = NSRect(x: 606, y: 348, width: 98, height: 18)
+        countLabel.alignment = .right
+        countLabel.textColor = .secondaryLabelColor
+        countLabel.font = .systemFont(ofSize: 11)
+        countLabel.autoresizingMask = [.minXMargin, .minYMargin]
+        view.addSubview(countLabel)
+
+        scroll.frame = NSRect(x: 0, y: 52, width: 720, height: 284)
         scroll.autoresizingMask = [.width, .height]
         scroll.documentView = table
         scroll.hasVerticalScroller = true

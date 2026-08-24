@@ -110,7 +110,14 @@ SPARKLE_DIR := .build/artifacts/sparkle/Sparkle
 SPARKLE_FRAMEWORK := $(SPARKLE_DIR)/Sparkle.xcframework/macos-arm64_x86_64/Sparkle.framework
 APPCAST_DIR := docs
 REPO := brendanbank/atrium-pa-mac
-DMG     := build/$(BUNDLE_NAME) $(VERSION).dmg
+# No spaces in the file name, deliberately.
+#
+# GitHub rewrites spaces when a release asset is uploaded — "Atrium PA
+# Capture 0.2.0.dmg" arrives as "Atrium.PA.Capture.0.2.0.dmg" — so an
+# appcast URL built from the local name 404s, and the update silently
+# never installs. The volume name inside the image is still the readable
+# one, which is what a person actually sees when they open it.
+DMG     := build/Atrium-PA-Capture-$(VERSION).dmg
 DMG_ROOT := build/dmg
 NOTARIZE_ZIP := build/notarize.zip
 

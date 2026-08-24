@@ -1,0 +1,14 @@
+<?xml version='1.0' encoding='utf-8'?>
+<rss xmlns:sparkle="http://www.andymatuschak.org/xml-namespaces/sparkle" version="2.0">
+    <channel>
+        <title>Atrium PA Capture</title>
+        <item>
+            <title>0.2.0</title>
+            <pubDate>Mon, 24 Aug 2026 23:38:00 +0200</pubDate>
+            <sparkle:version>200</sparkle:version>
+            <sparkle:shortVersionString>0.2.0</sparkle:shortVersionString>
+            <sparkle:minimumSystemVersion>14.2</sparkle:minimumSystemVersion>
+            <enclosure url="https://github.com/brendanbank/atrium-pa-mac/releases/download/v0.2.0/Atrium-PA-Capture-0.2.0.dmg" length="2696011" type="application/octet-stream" sparkle:edSignature="9GHJcfFbVMQkv2EaJY5rjR/G46BK1Kol1s4qu0w+4jpG1RVM1JLbFBQ7/PKuV0c7PCVyo6McPiDJDP3sUmIWBg==" />
+        </item>
+    </channel>
+</rss>

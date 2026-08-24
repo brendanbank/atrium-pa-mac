@@ -38,8 +38,21 @@ BIN         := .build/$(CONFIG)/$(APP_NAME)
 # Falls back to ad-hoc when no such certificate exists, so a fresh
 # checkout still builds with no setup.
 SIGNING_CN := Atrium PA Capture (local dev)
-CODESIGN_IDENTITY ?= $(shell security find-identity -p codesigning 2>/dev/null \
-	| grep -q "$(SIGNING_CN)" && echo "$(SIGNING_CN)" || echo -)
+
+# A Developer ID wins when there is one, because it is the only identity
+# another Mac will accept. The self-signed certificate is the fallback
+# for local work, and ad-hoc is the fallback for a fresh checkout with
+# neither.
+#
+# `-v` matters: it lists only identities with a chain that actually
+# builds. A Developer ID certificate whose Apple intermediate is missing
+# appears in the unfiltered list and then fails to sign with
+# "unable to build chain to self-signed root". Choosing from the
+# unfiltered list would pick an identity that cannot sign.
+DEVELOPER_ID := $(shell security find-identity -v -p codesigning 2>/dev/null \
+	| sed -n 's/.*"\(Developer ID Application: [^"]*\)".*/\1/p' | head -1)
+CODESIGN_IDENTITY ?= $(or $(DEVELOPER_ID),$(shell security find-identity -p codesigning \
+	2>/dev/null | grep -q "$(SIGNING_CN)" && echo "$(SIGNING_CN)" || echo -))
 
 # Hardened runtime, but only for a real Developer ID.
 #
@@ -49,8 +62,15 @@ CODESIGN_IDENTITY ?= $(shell security find-identity -p codesigning 2>/dev/null \
 # identity: that path works today, and turning on a different runtime
 # for it would change the one configuration this app is known to capture
 # audio in, for no benefit until there is something to notarize.
+#
+# The timestamp goes with it. `--timestamp=none` is right for a local
+# signature — it needs no network and nothing checks it — and fatal for
+# a real one: notarization refuses a signature without a secure
+# timestamp, and the refusal names neither the flag nor the file.
+TIMESTAMP := --timestamp=none
 ifneq (,$(findstring Developer ID,$(CODESIGN_IDENTITY)))
 SIGN_FLAGS := --options runtime --entitlements Resources/AtriumMac.entitlements
+TIMESTAMP := --timestamp
 endif
 
 VERSION := $(shell plutil -extract CFBundleShortVersionString raw Resources/Info.plist)
@@ -82,7 +102,7 @@ bundle: build
 	@echo "built $(BUNDLE)"
 
 sign:
-	@codesign --force --sign "$(CODESIGN_IDENTITY)" --timestamp=none $(SIGN_FLAGS) "$(BUNDLE)"
+	@codesign --force --sign "$(CODESIGN_IDENTITY)" $(TIMESTAMP) $(SIGN_FLAGS) "$(BUNDLE)"
 	@codesign -dv "$(BUNDLE)" 2>&1 | grep -E 'Identifier|Info.plist' || true
 
 # Launch through LaunchServices, NOT by exec'ing the binary directly.

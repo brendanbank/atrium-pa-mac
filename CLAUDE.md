@@ -837,6 +837,28 @@ a call is recorded.
 Stapling is not optional: without it the first launch needs the network
 to check the notarization, so an image opened on a train is refused.
 
+**And it takes two submissions, not one.** Stapling a disk image tickets
+the image and nothing inside it — measured: after `stapler staple` on
+the dmg, the app it contained still reported *"does not have a ticket
+stapled to it"*. Since the whole point of the image is that somebody
+drags the app out of it, the copy they keep is the one that needs the
+ticket. So `make notarize` staples the app first, builds the image
+around the stapled app, and notarizes the image in its own right.
+
+That ordering is load-bearing: `notarize` used to depend on `dmg`, which
+depends on `bundle`, which **re-signs the app and throws the ticket
+away** one step before the image is built. `dmg-image` packages without
+that prerequisite. Putting it back would look like an obvious tidy-up.
+
+Two things this cost before they were fixed, both worth not repeating.
+`make notarize` printed "NOT notarized — you need a Developer ID" and
+then submitted anyway, so Apple spent four minutes reporting three
+things `CODESIGN_IDENTITY` already knew; it refuses up front now. And
+`make signing-identity` reported on the *local dev* certificate while
+builds were signing with the Developer ID — the one command you would
+run to answer "what is this signing with?" answered a different
+question.
+
 ## The icon is atrium's own mark, drawn rather than imported
 
 `Resources/AppIcon.icns` is committed, so a fresh checkout builds without

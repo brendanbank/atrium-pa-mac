@@ -76,6 +76,7 @@ endif
 VERSION := $(shell plutil -extract CFBundleShortVersionString raw Resources/Info.plist)
 DMG     := build/$(BUNDLE_NAME) $(VERSION).dmg
 DMG_ROOT := build/dmg
+NOTARIZE_ZIP := build/notarize.zip
 
 # Notarization credentials, stored once with:
 #
@@ -84,7 +85,7 @@ DMG_ROOT := build/dmg
 #
 NOTARY_PROFILE ?= atrium-notary
 
-.PHONY: all build bundle sign run clean probes verify test test-live signing-identity trust-keychain icon install dmg notarize
+.PHONY: all build bundle sign run clean probes verify test test-live signing-identity trust-keychain icon install dmg dmg-image notarize
 
 all: bundle
 
@@ -135,7 +136,15 @@ verify: bundle
 # to System Settings › Privacy & Security and press Open Anyway, for
 # every release. `make notarize` is what removes that, and it needs the
 # Developer ID.
-dmg: bundle
+dmg: bundle dmg-image
+
+# Packaging only, with no `bundle` prerequisite on purpose.
+#
+# `notarize` staples the ticket into the .app and then packages it, and
+# `bundle` re-signs — which throws the ticket away. Depending on
+# `bundle` here would quietly undo the stapling one line before the
+# image was built.
+dmg-image:
 	@rm -rf "$(DMG_ROOT)" "$(DMG)"
 	@mkdir -p "$(DMG_ROOT)"
 	@cp -R "$(BUNDLE)" "$(DMG_ROOT)/"
@@ -162,6 +171,14 @@ dmg: bundle
 #
 # Stapling matters: without it the first launch needs the network to
 # check, and a laptop opening this on a train would be refused.
+#
+# **Two submissions, not one.** Stapling a disk image tickets the image
+# and nothing inside it — measured: after `stapler staple` on the dmg,
+# the app it contained still reported "does not have a ticket stapled to
+# it". Since the whole point of the image is that somebody drags the app
+# out of it, the copy they keep is the one that needs the ticket. So the
+# app is notarized and stapled first, and the image is built around the
+# stapled app and notarized in its own right.
 # Refuses rather than submits when the identity is wrong.
 #
 # It used to print "NOT notarized, you need a Developer ID" from `dmg`
@@ -170,33 +187,28 @@ dmg: bundle
 # the upload: not a Developer ID certificate, no secure timestamp, no
 # hardened runtime. Those are exactly the three things CODESIGN_IDENTITY
 # decides, so check it here instead of asking Cupertino.
-notarize: dmg
+notarize: bundle
 	@echo "$(CODESIGN_IDENTITY)" | grep -q "Developer ID" || { \
 		echo "refusing to submit: signed with '$(CODESIGN_IDENTITY)'"; \
 		echo "   Notarization needs a Developer ID Application certificate."; \
 		echo "   'make signing-identity' shows what this machine has."; \
 		exit 1; \
 	}
-	@echo "submitting $(DMG) — this takes a few minutes"
+	@echo "[1/2] notarizing the app — this takes a few minutes"
+	@rm -f "$(NOTARIZE_ZIP)"
+	@ditto -c -k --keepParent "$(BUNDLE)" "$(NOTARIZE_ZIP)"
+	@xcrun notarytool submit "$(NOTARIZE_ZIP)" \
+		--keychain-profile "$(NOTARY_PROFILE)" --wait
+	@rm -f "$(NOTARIZE_ZIP)"
+	@xcrun stapler staple "$(BUNDLE)"
+	@echo "[2/2] notarizing the image"
+	@$(MAKE) --no-print-directory dmg-image
 	@xcrun notarytool submit "$(DMG)" --keychain-profile "$(NOTARY_PROFILE)" --wait
 	@xcrun stapler staple "$(DMG)"
 	@xcrun stapler validate "$(DMG)"
 	@spctl --assess --type open --context context:primary-signature -v "$(DMG)" || true
-	@echo "notarized and stapled — this image opens on any Mac"
+	@echo "notarized and stapled — this image opens on any Mac, offline"
 
-# Install into /Applications, which is where a Mac app lives.
-#
-# `make run` launches out of ./build, which is fine while working on it
-# and wrong for using it: the path is inside a git worktree, so the app
-# people actually rely on sits somewhere that gets moved, rebuilt or
-# deleted — and two checkouts means two copies and no way to tell which
-# one is running.
-#
-# The signing identity is what TCC keys on, not the path, so grants
-# survive the move. The login item does not: `SMAppService` registered
-# the old location, so it is re-registered from the new one on next
-# launch via Settings.
-INSTALL_DIR ?= /Applications
 install: bundle
 	@rm -rf "$(INSTALL_DIR)/$(BUNDLE_NAME).app"
 	@cp -R "$(BUNDLE)" "$(INSTALL_DIR)/"

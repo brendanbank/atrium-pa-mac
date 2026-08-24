@@ -93,6 +93,23 @@ TIMESTAMP := --timestamp
 endif
 
 VERSION := $(shell plutil -extract CFBundleShortVersionString raw Resources/Info.plist)
+
+# What Sparkle compares to decide whether an update is newer.
+#
+# CFBundleVersion sat at "1" for both 0.1.0 and 0.1.1, which would have
+# shipped an updater that never offered anything: the feed would list a
+# build the app considered equal to itself. Derived from the marketing
+# version so it cannot drift — 0.1.1 becomes 101, 1.2.3 becomes 10203 —
+# and written into the bundle rather than the source plist, so there is
+# no second number to remember to bump.
+BUILD_NUMBER := $(shell echo "$(VERSION)" | awk -F. '{printf "%d", $$1*10000 + $$2*100 + $$3}')
+
+# Sparkle, unpacked by SwiftPM. Both the framework the app embeds and
+# the tools that sign a release live here.
+SPARKLE_DIR := .build/artifacts/sparkle/Sparkle
+SPARKLE_FRAMEWORK := $(SPARKLE_DIR)/Sparkle.xcframework/macos-arm64_x86_64/Sparkle.framework
+APPCAST_DIR := docs
+REPO := brendanbank/atrium-pa-mac
 DMG     := build/$(BUNDLE_NAME) $(VERSION).dmg
 DMG_ROOT := build/dmg
 NOTARIZE_ZIP := build/notarize.zip
@@ -104,7 +121,7 @@ NOTARIZE_ZIP := build/notarize.zip
 #
 NOTARY_PROFILE ?= atrium-notary
 
-.PHONY: all build bundle sign run clean probes verify test test-live signing-identity trust-keychain icon install dmg dmg-image notarize
+.PHONY: all build bundle sign run clean probes verify test test-live signing-identity trust-keychain icon install dmg dmg-image notarize appcast
 
 all: bundle
 
@@ -123,14 +140,55 @@ bundle: build
 		}; \
 	done
 	@cp Resources/Info.plist "$(BUNDLE)/Contents/Info.plist"
+	@plutil -replace CFBundleVersion -string "$(BUILD_NUMBER)" \
+		"$(BUNDLE)/Contents/Info.plist"
+	@mkdir -p "$(BUNDLE)/Contents/Frameworks"
+	@cp -R "$(SPARKLE_FRAMEWORK)" "$(BUNDLE)/Contents/Frameworks/"
+	@install_name_tool -add_rpath @executable_path/../Frameworks \
+		"$(BUNDLE)/Contents/MacOS/$(APP_NAME)" 2>/dev/null || true
 	@cp Resources/AppIcon.icns "$(BUNDLE)/Contents/Resources/AppIcon.icns"
 	@printf 'APPL????' > "$(BUNDLE)/Contents/PkgInfo"
 	@$(MAKE) --no-print-directory sign
 	@echo "built $(BUNDLE) [$$(lipo -archs "$(BUNDLE)/Contents/MacOS/$(APP_NAME)")]"
 
 sign:
+	@# Inside out. `codesign` seals nested code, so signing the app around
+	@# unsigned nested code produces a bundle that fails its own
+	@# verification, and Sparkle's XCFramework arrives unsigned from
+	@# SwiftPM.
+	@#
+	@# Every nested Mach-O is named explicitly rather than found by
+	@# pattern. The first version of this matched only `*.xpc` and
+	@# `*.app`, which silently missed `Versions/B/Autoupdate` — a bare
+	@# executable, not a bundle. `codesign --deep` still reported the app
+	@# valid, and Apple rejected the notarisation four minutes later with
+	@# "The binary is not signed with a valid Developer ID certificate".
+	@# A local check that passes while the authoritative one fails is
+	@# worse than no check, so the list is the list.
+	@if [ -d "$(BUNDLE)/Contents/Frameworks/Sparkle.framework" ]; then \
+		F="$(BUNDLE)/Contents/Frameworks/Sparkle.framework"; \
+		codesign --force --sign "$(CODESIGN_IDENTITY)" $(TIMESTAMP) $(SIGN_FLAGS) \
+			"$$F/Versions/B/XPCServices/Downloader.xpc" \
+			"$$F/Versions/B/XPCServices/Installer.xpc" \
+			"$$F/Versions/B/Updater.app" \
+			"$$F/Versions/B/Autoupdate"; \
+		codesign --force --sign "$(CODESIGN_IDENTITY)" $(TIMESTAMP) $(SIGN_FLAGS) "$$F"; \
+	fi
 	@codesign --force --sign "$(CODESIGN_IDENTITY)" $(TIMESTAMP) $(SIGN_FLAGS) "$(BUNDLE)"
 	@codesign -dv "$(BUNDLE)" 2>&1 | grep -E 'Identifier|Info.plist' || true
+	@# Ask locally what Apple asks. `codesign --deep` calls a bundle
+	@# valid while a nested binary carries the wrong identity, so it
+	@# cannot answer "will this notarize?" — and finding out from the
+	@# notary service costs four minutes per attempt.
+	@if echo "$(CODESIGN_IDENTITY)" | grep -q "Developer ID"; then \
+		find "$(BUNDLE)" -type f -perm +111 | while read -r f; do \
+			file "$$f" | grep -q Mach-O || continue; \
+			codesign -dvvv "$$f" 2>&1 | grep -q "Authority=Developer ID Application" \
+				|| { echo "not signed with the Developer ID: $$f"; exit 1; }; \
+			codesign -dvvv "$$f" 2>&1 | grep -q "^Timestamp=" \
+				|| { echo "no secure timestamp: $$f"; exit 1; }; \
+		done || exit 1; \
+	fi
 
 # Launch through LaunchServices, NOT by exec'ing the binary directly.
 # TCC attributes a directly-exec'd binary to the parent terminal, which
@@ -234,6 +292,27 @@ notarize: bundle
 	@xcrun stapler validate "$(DMG)"
 	@spctl --assess --type open --context context:primary-signature -v "$(DMG)" || true
 	@echo "notarized and stapled — this image opens on any Mac, offline"
+	@$(MAKE) --no-print-directory appcast
+
+# Sign the release into the update feed.
+#
+# `generate_appcast` signs each image with the EdDSA key in the login
+# Keychain — the one that never leaves this Mac, and the reason a
+# compromised GitHub account still cannot push a malicious update.
+#
+# The URL rewrite is the awkward part. GitHub puts the tag in the asset
+# path, so every version has a different prefix and `--download-url-prefix`
+# can only hold one. Rather than host the images on Pages and grow the
+# repository by a disk image per release for ever, the enclosure URLs are
+# rewritten afterwards from each item's own version.
+appcast:
+	@mkdir -p "$(APPCAST_DIR)" build/appcast
+	@cp "$(DMG)" build/appcast/ 2>/dev/null || true
+	@$(SPARKLE_DIR)/bin/generate_appcast build/appcast \
+		--download-url-prefix "https://github.com/$(REPO)/releases/download/PLACEHOLDER/"
+	@python3 Tools/fix-appcast.py build/appcast/appcast.xml "$(APPCAST_DIR)/appcast.xml" \
+		"https://github.com/$(REPO)/releases/download"
+	@echo "wrote $(APPCAST_DIR)/appcast.xml — commit it, then push to publish"
 
 # `make run` launches out of ./build, which is fine while working on it
 # and wrong for using it: the path is inside a git worktree, so the app

@@ -37,6 +37,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     /// Held across a sleep so the wake handler knows what to resume.
     private var interruptedSession: Session?
     private var queueSummary = UploadQueue.Summary()
+    private let updater = Updater()
+
+    /// Reached through the responder chain from the App menu.
+    ///
+    /// A menu item with no target walks the chain looking for anything
+    /// that answers this selector, which is what lets `MainMenu` stay a
+    /// plain description of the menu rather than needing a reference to
+    /// whatever happens to own the updater.
+    @objc func checkForUpdatesFromMenu(_ sender: Any?) {
+        updater.checkForUpdates(sender)
+    }
     private var namingWindow: SpeakerNamingWindow?
     private var activityWindow: ActivityWindow?
     /// The **Capture** menu in the menu bar. Held so its submenu can be
@@ -66,6 +77,26 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         controller = SessionController(allowlist: { [weak self] in
             self?.allowlist ?? .defaults
         })
+        // What a relaunch would cost, asked at the moment it matters.
+        //
+        // A meeting this app fails to record cannot be recovered, and a
+        // pending upload's `.m4a` is the only copy of that conversation
+        // once Atrium PA sweeps its vault. An update can wait for both.
+        updater.isBusy = { [weak self] in
+            guard let self else { return (true, "still starting up") }
+            if self.controller.isRecording {
+                return (true, "a recording is running")
+            }
+            if self.queueSummary.hasWork {
+                return (
+                    true,
+                    "\(self.queueSummary.pending + self.queueSummary.uploaded) "
+                        + "recording(s) still uploading")
+            }
+            return (false, "")
+        }
+        updater.start()
+
         controller.onStart = { [weak self] session in
             DispatchQueue.main.async { self?.sessionStarted(session) }
         }

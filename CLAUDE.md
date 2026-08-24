@@ -875,6 +875,54 @@ builds were signing with the Developer ID — the one command you would
 run to answer "what is this signing with?" answered a different
 question.
 
+## Updating an installed copy, and the two keys that takes
+
+Apple offers **no** auto-update mechanism outside the App Store, and this
+app can never ship there — the App Store requires sandboxing and a
+sandboxed process cannot create a process tap at all. So updates are
+Sparkle's, from a signed appcast at `docs/appcast.xml`, served by GitHub
+Pages and pointing at release assets.
+
+**The signature is what makes it safe, not the host.** Sparkle assumes
+the server is hostile. Two keys, and they are separate on purpose:
+
+| key | issued by | proves | if stolen |
+|---|---|---|---|
+| Developer ID | Apple | Gatekeeper trusts this app to run | Apple revokes; every copy stops launching |
+| EdDSA | us, in the login Keychain | *this update* came from us | an attacker can push a malicious update |
+
+A compromised CDN, or a compromised GitHub account — which is the case
+actually worth defending against — can serve whatever it likes and the
+update is refused, because the EdDSA private half never leaves this Mac.
+Reusing the Developer ID for both would put its private key wherever
+releases are built and collapse two failure modes into one.
+
+**`CFBundleVersion` is what Sparkle compares.** It sat at `1` for both
+0.1.0 and 0.1.1, which would have shipped an updater that never offered
+anything: the feed would list a build the app considered equal to
+itself. It is now derived from the marketing version at bundle time —
+0.2.0 becomes 200 — so there is no second number to remember.
+
+**A recorder cannot just relaunch.** Sparkle installs by quitting and
+reopening. `Updater.isBusy` refuses while a recording is running or the
+queue still has work, because a meeting this app fails to record cannot
+be recovered and a pending upload's `.m4a` is the only copy of that
+conversation once Atrium PA sweeps its vault. The postponement **holds
+the install handler and retries every minute**, rather than declining:
+a postponed update with nothing watching for the moment to resume lasts
+until the next launch, and an app that starts at login and runs for
+weeks would never update at all.
+
+**Two build details that are easy to get wrong.** The Sparkle framework
+arrives unsigned from SwiftPM and has to be signed *inside out* — the
+XPC services, then the framework, then the app — or the app fails its
+own verification. And the appcast's enclosure URLs are rewritten after
+`generate_appcast` runs (`Tools/fix-appcast.py`), because GitHub puts the
+tag in the asset path so every version needs a different prefix and
+`--download-url-prefix` holds only one. The alternative, hosting images
+on Pages so the prefix is constant, grows the git history by a disk
+image per release for ever.
+
 ## The icon is atrium's own mark, drawn rather than imported
 
 `Resources/AppIcon.icns` is committed, so a fresh checkout builds without
@@ -956,6 +1004,7 @@ make test       # unit tests (no network, no microphone)
 make test-live  # ...plus a real upload to Atrium PA. Needs credentials
 make probes     # build the standalone feasibility probes
 make icon       # redraw Resources/AppIcon.icns (committed; rarely needed)
+make appcast    # sign the built image into docs/appcast.xml (run by notarize)
 ```
 
 `~/Library/Application Support/AtriumMac/`, all seeded on first launch:

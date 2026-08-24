@@ -19,6 +19,9 @@ enum MainMenu {
         appMenu.addItem(
             withTitle: "About \(appName)", action: #selector(NSApplication.orderFrontStandardAboutPanel(_:)),
             keyEquivalent: "")
+        appMenu.addItem(
+            withTitle: "Check for Updates…",
+            action: Selector(("checkForUpdatesFromMenu:")), keyEquivalent: "")
         appMenu.addItem(.separator())
         // ⌘, in the App menu, which is where every Mac user looks for
         // it. The item is filled in by the delegate — this only owns the

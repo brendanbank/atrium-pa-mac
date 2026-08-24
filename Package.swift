@@ -9,6 +9,17 @@ let package = Package(
         // (AudioHardwareCreateProcessTap). Both are load-bearing.
         .macOS("14.2")
     ],
+    dependencies: [
+        // Auto-update. Apple offers no mechanism for apps outside the
+        // App Store, and this app can never ship there: the App Store
+        // requires sandboxing and a sandboxed process cannot create a
+        // CoreAudio process tap at all.
+        //
+        // Pinned to the current 2.9.x. Sparkle ships as a SwiftPM
+        // package, which matters here — this project builds with the
+        // Command Line Tools alone.
+        .package(url: "https://github.com/sparkle-project/Sparkle", from: "2.9.6")
+    ],
     targets: [
         // The realtime audio callback must not allocate, lock, or touch
         // ARC. That is not a discipline Swift makes easy to guarantee, so
@@ -27,7 +38,10 @@ let package = Package(
         ),
         .executableTarget(
             name: "AtriumMac",
-            dependencies: ["CRingBuffer", "AtriumCore"],
+            dependencies: [
+                "CRingBuffer", "AtriumCore",
+                .product(name: "Sparkle", package: "Sparkle"),
+            ],
             swiftSettings: [.swiftLanguageMode(.v5)]
         ),
 

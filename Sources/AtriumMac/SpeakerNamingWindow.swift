@@ -425,6 +425,77 @@ final class SpeakerNamingWindow: NSWindow, NSTextFieldDelegate {
 
     // MARK: - Actions
 
+    /// What to do when the typed name already belongs to somebody.
+    private enum DuplicateDecision {
+        case use(Int)
+        case createNew
+        case cancel
+    }
+
+    /// Ask the server whether this name already exists, and if so, ask
+    /// the user before creating a second one.
+    ///
+    /// Naming a voice from here created a duplicate person once: a new
+    /// record beside an existing one with the same name, which Atrium PA
+    /// disambiguated by appending the older person's id. The window
+    /// already had a search box that would have found them; nothing
+    /// consulted it when a name was typed by hand.
+    ///
+    /// **A failed search does not block the naming.** The check exists
+    /// to prevent a mess, not to become a new way for the work to fail —
+    /// if the roster cannot be reached, creating is still the answer the
+    /// user asked for. Logged either way, because a duplicate created
+    /// while the search was down should be explicable afterwards.
+    private func existingPerson(
+        named typed: String, using client: MCPClient
+    ) async -> DuplicateDecision {
+        let found: [MCPClient.Person]
+        do {
+            found = try await client.searchPeople(matching: typed)
+        } catch {
+            Log.write(
+                "naming: could not check whether “\(typed)” already exists "
+                    + "(\(error)) — creating anyway")
+            return .createNew
+        }
+
+        let duplicates = PersonMatch.duplicates(of: typed, in: found)
+        guard !duplicates.isEmpty else { return .createNew }
+
+        Log.write(
+            "naming: “\(typed)” already matches "
+                + duplicates.map { "person \($0.id)" }.joined(separator: ", "))
+
+        return await MainActor.run {
+            let alert = NSAlert()
+            alert.alertStyle = .warning
+            alert.messageText = "“\(typed)” already exists"
+            // The consequence is the point. Naming reaches backwards
+            // through every recording a voice appears in, so a duplicate
+            // does not just add a row — it splits one person's history
+            // in two.
+            alert.informativeText =
+                duplicates.count == 1
+                ? "Atrium PA already knows \(duplicates[0].label). Creating a "
+                    + "second one splits this voice's history across both, and "
+                    + "they have to be merged by hand afterwards."
+                : "Atrium PA already knows \(duplicates.count) people with this "
+                    + "name. Creating another makes it harder to tell them apart."
+
+            for candidate in duplicates.prefix(3) {
+                alert.addButton(withTitle: "Use \(candidate.label)")
+            }
+            alert.addButton(withTitle: "Create a new person")
+            alert.addButton(withTitle: "Cancel")
+
+            let choice = alert.runModal()
+            let offered = min(duplicates.count, 3)
+            let index = choice.rawValue - NSApplication.ModalResponse.alertFirstButtonReturn.rawValue
+            if index < offered { return .use(duplicates[index].id) }
+            return index == offered ? .createNew : .cancel
+        }
+    }
+
     @objc private func play() {
         guard let sample = evidence?.samples.first, let client else { return }
         setBusy(true)
@@ -466,10 +537,28 @@ final class SpeakerNamingWindow: NSWindow, NSTextFieldDelegate {
         let key = speaker.key
 
         Task { [weak self] in
+            // Creating a person is the only path that can make a mess
+            // the app cannot clean up, so it is the only one that asks
+            // first. Picking somebody from the roster already names an
+            // existing person and needs no check.
+            var resolvedPersonID = personID
+            if personID == nil {
+                switch await self?.existingPerson(named: typed, using: client) {
+                case .some(.cancel):
+                    await MainActor.run { self?.setBusy(false) }
+                    return
+                case .some(.use(let existing)):
+                    resolvedPersonID = existing
+                case .some(.createNew), .none:
+                    break
+                }
+            }
             do {
                 let result = try await client.nameSpeaker(
-                    captureID: captureID, voiceCluster: cluster, personID: personID,
-                    newPerson: personID == nil ? (typed, email.isEmpty ? nil : email) : nil,
+                    captureID: captureID, voiceCluster: cluster,
+                    personID: resolvedPersonID,
+                    newPerson: resolvedPersonID == nil
+                        ? (typed, email.isEmpty ? nil : email) : nil,
                     evidence: summary)
                 await MainActor.run {
                     // Logged as well as shown. Otherwise there is no way
@@ -478,7 +567,7 @@ final class SpeakerNamingWindow: NSWindow, NSTextFieldDelegate {
                     // question asked when a name turns out to be wrong.
                     Log.write(
                         "naming: named cluster \(cluster) as "
-                            + (personID.map { "person \($0)" }
+                            + (resolvedPersonID.map { "person \($0)" }
                                 ?? "new person “\(typed)”")
                             + " — \(result.turnsUpdated) turn(s), "
                             + "\(result.recordingsAffected) recording(s)")
@@ -487,7 +576,8 @@ final class SpeakerNamingWindow: NSWindow, NSTextFieldDelegate {
                     self?.detail.stringValue =
                         "Named — \(result.turnsUpdated) turns across "
                         + "\(result.recordingsAffected) recording(s)"
-                    self?.onResolved?(key, personID == nil ? typed : displayName)
+                    self?.onResolved?(
+                        key, resolvedPersonID == nil ? typed : displayName)
                     self?.advance()
                 }
             } catch {

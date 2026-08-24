@@ -633,6 +633,62 @@ enum UnitTests {
     // MARK: - SessionController
 
     private static func sessions(_ h: Harness) {
+        h.group("PersonMatch — not creating somebody twice")
+
+        func person(_ id: Int, _ name: String) -> MCPClient.Person {
+            MCPClient.Person(id: id, displayName: name, email: nil)
+        }
+
+        h.test("the same name in different case is the same person") {
+            let roster = [person(1, "Alex Rivera")]
+            try expectEqual(
+                PersonMatch.duplicates(of: "alex rivera", in: roster).first?.id, 1,
+                "case difference read as a different person")
+        }
+
+        h.test("a server disambiguator does not hide the duplicate") {
+            // Atrium PA appends the older person's id when two share a
+            // name, so the roster entry carries the evidence of the
+            // first duplicate. Missing this is how the third gets made.
+            let roster = [person(2571, "Sam Okafor (#2571)")]
+            try expectEqual(
+                PersonMatch.duplicates(of: "Sam Okafor", in: roster).first?.id, 2571,
+                "'(#2571)' made an existing person invisible")
+        }
+
+        h.test("punctuation and accents do not make a new person") {
+            let roster = [person(3, "Renée O'Brien")]
+            try expectEqual(
+                PersonMatch.duplicates(of: "Renee OBrien", in: roster).first?.id, 3,
+                "accents or punctuation read as a different person")
+        }
+
+        h.test("a genuinely different name is not a duplicate") {
+            // The asymmetry this rests on: a missed duplicate can be
+            // merged later, a false positive attributes a meeting to the
+            // wrong person across every recording their voice is in.
+            let roster = [person(5, "Alex Rivera")]
+            try expect(
+                PersonMatch.duplicates(of: "Alex Riveras", in: roster).isEmpty,
+                "'Alex Riveras' matched 'Alex Rivera' — a guess, not a match")
+            try expect(
+                PersonMatch.duplicates(of: "Alexandra Rivera", in: roster).isEmpty,
+                "a longer name matched a shorter one")
+        }
+
+        h.test("two people really can share a name, so all are returned") {
+            let roster = [person(7, "John Smith"), person(8, "John Smith (#7)")]
+            try expectEqual(
+                PersonMatch.duplicates(of: "John Smith", in: roster).count, 2,
+                "only one of two identical names offered")
+        }
+
+        h.test("an empty name matches nobody") {
+            try expect(
+                PersonMatch.duplicates(of: "   ", in: [person(1, "Alex Rivera")]).isEmpty,
+                "blank input matched a person")
+        }
+
         h.group("SessionController — what counts as a meeting")
 
         func event(_ bundleID: String, capturing: Bool) -> MicEvent {

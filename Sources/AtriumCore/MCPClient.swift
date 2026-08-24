@@ -387,6 +387,12 @@ public actor MCPClient {
         public let displayName: String
         public let email: String?
 
+        public init(id: Int, displayName: String, email: String?) {
+            self.id = id
+            self.displayName = displayName
+            self.email = email
+        }
+
         public var label: String {
             email.map { "\(displayName) — \($0)" } ?? displayName
         }

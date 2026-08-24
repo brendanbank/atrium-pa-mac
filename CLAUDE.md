@@ -506,14 +506,55 @@ delivering 16571** — AirPods in hands-free mode run at 16 kHz. Written
 into a file that says 48000, that audio is a third of its true length and
 plays three times too fast.
 
-`checkDeliveredRate` compares the claim against the delivery three
-seconds in, and believes the delivery. It asks the device again first,
-since it may simply have settled and an exact answer beats a measured
-one; failing that it snaps the measurement to a rate devices really run
-at — `AudioRates.nearestStandard`, because nothing runs at 16571 Hz and
-resampling from that number would bake a 3.6% error into every second.
+`checkDeliveredRate` corrects it, but only when **two independent
+sources agree**: the device's own rate re-read a couple of seconds after
+the aggregate was built, and the rate frames are actually arriving at.
+The device's figure is the one adopted — it is exact where a frame count
+is approximate — and the measurement's only job is to corroborate it,
+within 15%.
 
-Progression across four runs of the same switch, which is the honest
+Both halves of that are scar tissue.
+
+Correcting on the **measurement alone** ruined a recording. The window
+started at `start()`, so it counted the aggregate's spin-up before its
+first frame as slow delivery: a healthy 48 kHz device read as 18924 Hz,
+snapped to 16000, and the far end came out three times too long and an
+octave and a half down. The window now starts after frames are flowing.
+
+**Not correcting at all** was worse, and that is the part that was got
+wrong on purpose. After the above, the correction was reverted to
+report-only on the reasoning that an uncorrected mismatch merely costs
+some far-end audio while a false correction ruins the channel. That
+asymmetry was imaginary. Measured on a real 552-second Teams call:
+
+```
+mic 551.2s @24000Hz   far 275.6s @48000Hz   farEndPeak 0.917949
+```
+
+Exactly half. Nine minutes of conversation written at double speed, an
+octave up, unusable — not "short", *destroyed*. Leaving it alone is not
+the conservative option; it is just a different way to lose the far end.
+
+**Every second before it fires costs half a second of alignment.** Frames
+arriving at 24000 into a file labelled 48000 take half the space they
+should, so everything after the correction sits early by half the
+exposure, for the whole recording. Measured on the same switch:
+
+| baseline at | corrected after | mic − far |
+|---|---|---|
+| +2 s, 3 s window | 4.9 s | 2.44 s |
+| +0.5 s, 1.5 s window | 1.9 s | 0.92 s |
+
+A 2:1 ratio needs no precision, so the window is as short as it can be
+while still excluding the spin-up.
+
+**It has to keep asking.** A Bluetooth link settles on its own schedule,
+and a single check that arrives before the device admits its real rate
+finds nothing, never asks again, and writes the entire call at the wrong
+speed. So a check that corrects nothing schedules another, up to six
+times; adopting a rate stops it.
+
+Progression across five runs of the same switch, which is the honest
 measure of whether this converged:
 
 | | rebuilds | far end short by |
@@ -522,7 +563,7 @@ measure of whether this converged:
 | device property only | 1 | 61.4 s, noticed 28 s late |
 | + stall detection | 10 | 11.9 s |
 | + UID guard | 1 | 15.4 s |
-| + believing the delivered rate | 1 | *to be measured* |
+| + correcting a corroborated rate | 1 | 0.92 s |
 
 ## Two retention windows, because the two files are not worth the same
 

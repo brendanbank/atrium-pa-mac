@@ -250,9 +250,13 @@ final class ProcessTap {
         // stretched three times longer and an octave and a half down.
         // A wrong rate here damages the whole recording, so it is
         // measured over an interval where nothing but audio happened.
-        DispatchQueue.main.asyncAfter(deadline: .now() + 2) { [weak self] in
-            self?.sampleDeliveryBaseline()
-        }
+        //
+        // Every second before it fires is a second of far end written at
+        // the wrong rate, so the window is as short as it can be while
+        // still excluding the spin-up: at 2:1 the ratio is unmissable
+        // and needs no precision at all.
+        rateChecksRemaining = 6
+        scheduleRateCheck(after: 0.5)
 
         // Mono at the device's own rate. Mono because the recorder wants
         // one far-end channel and folding here is a handful of adds on a
@@ -404,20 +408,48 @@ final class ProcessTap {
     private var baselineFrames = 0
     private var baselineSeconds: TimeInterval = 0
 
+    /// How many more times to look before giving up.
+    ///
+    /// Checking once was not enough. A Bluetooth link settles on its own
+    /// schedule, and if the device has not yet admitted its real rate at
+    /// the moment of the single check, nothing ever asks again and the
+    /// whole recording is written at the wrong speed. Asking repeatedly
+    /// costs a frame count and a property read.
+    private var rateChecksRemaining = 0
+
+    private func scheduleRateCheck(after delay: TimeInterval) {
+        guard rateChecksRemaining > 0 else { return }
+        rateChecksRemaining -= 1
+        DispatchQueue.main.asyncAfter(deadline: .now() + delay) { [weak self] in
+            self?.sampleDeliveryBaseline()
+        }
+    }
+
     private func sampleDeliveryBaseline() {
-        guard procID != nil, framesProduced > 0 else { return }
+        guard procID != nil else { return }
+        // No frames yet means the aggregate is still spinning up, which
+        // is the state this must not measure across.
+        guard framesProduced > 0 else { return scheduleRateCheck(after: 1) }
         baselineFrames = framesProduced
         baselineSeconds = ProcessInfo.processInfo.systemUptime
-        DispatchQueue.main.asyncAfter(deadline: .now() + 3) { [weak self] in
+        DispatchQueue.main.asyncAfter(deadline: .now() + measuringWindow) {
+            [weak self] in
             self?.checkDeliveredRate()
         }
     }
+
+    /// Long enough to be sure, short enough to be cheap when it is
+    /// wrong. A device running at half its claimed rate is a 2:1 ratio;
+    /// a second and a half of frames settles that beyond argument.
+    private let measuringWindow: TimeInterval = 1.5
 
     private func checkDeliveredRate() {
         guard procID != nil, baselineSeconds > 0 else { return }
         let window = ProcessInfo.processInfo.systemUptime - baselineSeconds
         let framesInWindow = framesProduced - baselineFrames
-        guard window > 1, framesInWindow > 0 else { return }
+        guard window > 1, framesInWindow > 0 else {
+            return scheduleRateCheck(after: 1)
+        }
 
         let delivered = Double(framesInWindow) / window
         let ratio = delivered / tapRate
@@ -425,29 +457,71 @@ final class ProcessTap {
         // A stream that has stopped is not a stream at the wrong rate.
         // Correcting one as the other would stretch whatever arrives
         // next; `restartIfStalled` owns that case.
-        guard ratio > 0.25 else { return }
+        guard ratio > 0.25 else { return scheduleRateCheck(after: 2) }
+
+        // Delivery matches the claim. Nothing to correct — and nothing
+        // to keep watching for either, because a device that settles
+        // does so at the start.
         guard ratio < 0.9 || ratio > 1.1 else { return }
 
-        // Reported, never acted on.
+        // Two independent sources have to agree before anything is
+        // touched, because getting this wrong is worse than leaving it.
         //
-        // This used to adopt the measured rate and resample from it. It
-        // was wrong twice over. The measurement counted the spin-up
-        // before the first frame, so a healthy 48 kHz device read as
-        // 18924 Hz, snapped to 16000, and the far end came out three
-        // times too long and an octave and a half down — audibly ruined,
-        // on a real recording.
+        // The first attempt at this measured from `start()`, counting
+        // the aggregate's spin-up before its first frame as slow
+        // delivery: a healthy 48 kHz device read as 18924 Hz and the far
+        // end was stretched three times too long. That was a bad
+        // measurement, not a bad idea — the window is now sampled twice
+        // in steady state, and the device's own re-read has to confirm
+        // it.
         //
-        // And the asymmetry is the point. Not correcting a genuine rate
-        // mismatch costs some far-end audio, which the encoder pads and
-        // the log reports. Correcting a false one ruins the whole
-        // channel. Those are not the same size of mistake, so this says
-        // what it sees and leaves the audio alone.
+        // Leaving it alone is not the safe option it looked like.
+        // Measured on a 552-second Teams call: the aggregate reported
+        // 48000 while the AirPods ran at 24000, so nine minutes of real
+        // conversation were written at double speed, exactly an octave
+        // up.
+        let reread = currentDeviceRate()
+        let snapped = AudioRates.nearestStandard(to: delivered)
+
+        guard let reread, abs(reread / delivered - 1) < 0.15, reread != tapRate else {
+            // The device still insists on the rate it was created with,
+            // or its answer does not match what is arriving. Say so and
+            // change nothing: a correction nobody can corroborate is how
+            // a recording gets ruined.
+            Log.write(
+                String(
+                    format: "tap: claims %.0f Hz, appears to deliver %.0f, device now "
+                        + "says %@ — not corrected, nothing corroborates it",
+                    tapRate, delivered,
+                    reread.map { String(format: "%.0f", $0) } ?? "nothing"))
+            // A link that has not settled yet will say so shortly.
+            return scheduleRateCheck(after: 3)
+        }
+
+        // The device's own figure is exact where the measurement is
+        // approximate, so it is the one adopted — the measurement's job
+        // was only to agree.
         Log.write(
             String(
-                format: "tap: the aggregate claims %.0f Hz but appears to deliver "
-                    + "%.0f — not correcting it; if the far end sounds wrong, this "
-                    + "line is why",
-                tapRate, delivered))
+                format: "tap: the aggregate was created at %.0f Hz but the device now "
+                    + "reports %.0f and delivers %.0f — resampling the far end to "
+                    + "%.0f Hz for the file",
+                tapRate, reread, delivered, outputRate))
+        if snapped != reread {
+            Log.write(
+                String(
+                    format: "tap: (the measurement alone would have said %.0f)", snapped))
+        }
+
+        rateChecksRemaining = 0
+        tapRate = reread
+        rateAdapter =
+            reread == outputRate ? nil : Resampler(from: reread, to: outputRate)
+        if reread != outputRate, rateAdapter == nil {
+            Log.write(
+                "tap: could not build a resampler from \(Int(reread)) to "
+                    + "\(Int(outputRate)) Hz — the far end stays at the wrong speed")
+        }
     }
 
     /// What the aggregate says its rate is, right now.

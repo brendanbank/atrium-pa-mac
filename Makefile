@@ -162,7 +162,21 @@ dmg: bundle
 #
 # Stapling matters: without it the first launch needs the network to
 # check, and a laptop opening this on a train would be refused.
+# Refuses rather than submits when the identity is wrong.
+#
+# It used to print "NOT notarized, you need a Developer ID" from `dmg`
+# and then submit the image regardless. Apple takes several minutes to
+# answer, and the answer was three errors that were all knowable before
+# the upload: not a Developer ID certificate, no secure timestamp, no
+# hardened runtime. Those are exactly the three things CODESIGN_IDENTITY
+# decides, so check it here instead of asking Cupertino.
 notarize: dmg
+	@echo "$(CODESIGN_IDENTITY)" | grep -q "Developer ID" || { \
+		echo "refusing to submit: signed with '$(CODESIGN_IDENTITY)'"; \
+		echo "   Notarization needs a Developer ID Application certificate."; \
+		echo "   'make signing-identity' shows what this machine has."; \
+		exit 1; \
+	}
 	@echo "submitting $(DMG) — this takes a few minutes"
 	@xcrun notarytool submit "$(DMG)" --keychain-profile "$(NOTARY_PROFILE)" --wait
 	@xcrun stapler staple "$(DMG)"
@@ -225,6 +239,10 @@ signing-identity:
 		rm -rf $$tmp; \
 		echo "created '$(SIGNING_CN)' — rebuilds now keep their TCC grants"; \
 	fi
+	@echo "builds will sign with: $(CODESIGN_IDENTITY)"
+	@echo "$(CODESIGN_IDENTITY)" | grep -q "Developer ID" \
+		&& echo "   hardened runtime on, timestamped — 'make notarize' will work" \
+		|| echo "   local only. 'make notarize' needs a Developer ID Application cert"
 
 # One-time: stop macOS prompting for the login password on every run.
 #

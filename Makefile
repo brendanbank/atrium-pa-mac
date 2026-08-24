@@ -235,6 +235,17 @@ notarize: bundle
 	@spctl --assess --type open --context context:primary-signature -v "$(DMG)" || true
 	@echo "notarized and stapled — this image opens on any Mac, offline"
 
+# `make run` launches out of ./build, which is fine while working on it
+# and wrong for using it: the path is inside a git worktree, so the app
+# people actually rely on sits somewhere that gets moved, rebuilt or
+# deleted — and two checkouts means two copies and no way to tell which
+# one is running.
+#
+# The signing identity is what TCC keys on, not the path, so grants
+# survive the move. The login item does not: `SMAppService` registered
+# the old location, so it is re-registered from the new one on next
+# launch via Settings.
+INSTALL_DIR ?= /Applications
 install: bundle
 	@rm -rf "$(INSTALL_DIR)/$(BUNDLE_NAME).app"
 	@cp -R "$(BUNDLE)" "$(INSTALL_DIR)/"

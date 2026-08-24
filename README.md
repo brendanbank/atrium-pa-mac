@@ -1,8 +1,7 @@
 # Atrium PA Capture
 
 A small macOS menu-bar app that notices when a meeting starts, records
-both sides of it, and hands the audio to
-[Atrium PA](https://github.com/Brendan-Bank/atrium-pa) for transcription.
+both sides of it, and hands the audio to Atrium PA for transcription.
 
 No "join your meeting" bot, no calendar integration, no cloud middleman.
 It watches CoreAudio for the moment an app grabs the microphone, and it

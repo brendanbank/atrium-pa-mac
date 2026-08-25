@@ -3,13 +3,16 @@ import AppKit
 import AtriumCore
 import Foundation
 
-/// "Who was that?" — one voice at a time.
+/// "Who was in this recording?" — every voice at once.
 ///
-/// The window exists because naming a voice is worth interrupting for
-/// *once* and never again: an unnamed cluster matches nothing, so the
-/// same person comes back unknown in every later recording, and naming
-/// them here fixes this transcript and all of them. `name_speaker`
-/// reports how many, and so does this.
+/// This asked about one voice at a time behind a Next button. That is
+/// the wrong shape for the actual task: a recording has three or four
+/// people in it, and telling them apart means comparing them. Behind a
+/// wizard, comparing two voices meant remembering the previous one.
+///
+/// So every voice is a row — including the ones already identified.
+/// "Who else is in this recording" is most of the context for answering
+/// "who is this", and hiding the settled ones threw it away.
 ///
 /// ## What it will not do
 ///
@@ -23,104 +26,66 @@ import Foundation
 /// percentage appears next to its band because 44% and 91% must not read
 /// the same, and an invitee who declined is not offered at all: the
 /// server returns the RSVP, and somebody who said no was not there.
-final class SpeakerNamingWindow: NSWindow, NSTextFieldDelegate {
+final class SpeakerNamingWindow: NSWindow, AVAudioPlayerDelegate {
 
-    /// Called with the `unknown_speakers[]` key once a voice has been
-    /// named or dismissed, so the badge can come down and stay down.
-    /// The name is carried too when there was one, because the activity
-    /// window has no other way to learn it — reading the roster back
-    /// would need `pa.read`.
+    /// Called with the speaker key once a voice has been named, so the
+    /// badge can come down and stay down. The name is carried too
+    /// because the activity window has no other way to learn it.
     var onResolved: ((String, String?) -> Void)?
-
-    /// One thing to ask about. Both kinds end in the same call —
-    /// `name_speaker` with a person — so they share the whole window;
-    /// only the heading and what is pre-filled differ.
-    enum Question {
-        /// Nobody has put a name to this voice.
-        case unnamed(MCPClient.UnknownSpeaker)
-        /// Atrium PA has, but only as a guess, and nobody has agreed.
-        case unconfirmed(MCPClient.ProvisionalMatch)
-
-        var voiceCluster: Int? {
-            switch self {
-            case .unnamed(let speaker): return speaker.voiceCluster
-            case .unconfirmed(let match): return match.voiceCluster
-            }
-        }
-
-        var key: String {
-            switch self {
-            case .unnamed(let speaker): return speaker.key
-            case .unconfirmed(let match): return match.key
-            }
-        }
-
-        var turnCount: Int {
-            switch self {
-            case .unnamed(let speaker): return speaker.turnCount
-            case .unconfirmed(let match): return match.turnCount
-            }
-        }
-    }
 
     private var item: QueueItem?
     private var client: MCPClient?
-    private var queue: [Question] = []
-    private var index = 0
-
-    /// The person the user has settled on, when they picked one from a
-    /// list rather than typing a new one.
-    ///
-    /// Cleared the moment the name field is edited by hand: at that
-    /// point the typed text is the answer and the earlier selection is
-    /// not. See `controlTextDidChange`.
-    private var selectedPersonID: Int?
-    private var evidence: MCPClient.SpeakerEvidence?
+    private var rows: [VoiceRow] = []
+    private let newPersonSheet = NewPersonSheet()
+    private var evidenceByKey: [String: MCPClient.SpeakerEvidence] = [:]
     private var player: AVAudioPlayer?
+    /// Which row is sounding, so its button can be put back.
+    private var playingRow: VoiceRow?
+    /// Bumped on every play or stop, so a clip that finishes
+    /// downloading after the user changed their mind does not start
+    /// playing anyway.
+    private var playGeneration = 0
 
-    // Views
     private let heading = NSTextField(labelWithString: "")
-    private let quote = NSTextField(labelWithString: "")
-    private let detail = NSTextField(labelWithString: "")
-    private let playButton = NSButton()
-    private let candidates = NSPopUpButton()
-    private let searchField = NSTextField()
-    private let searchButton = NSButton()
-    private let searchResults = NSPopUpButton()
-    private let newName = NSTextField()
-    private let newEmail = NSTextField()
-    /// People the last search returned, parallel to `searchResults`.
-    private var found: [MCPClient.Person] = []
-    private let spinner = NSProgressIndicator()
-    private let nameButton = NSButton()
-    private let skipButton = NSButton()
-    private let laterButton = NSButton()
+    private let stack = NSStackView()
+    private let scroll = NSScrollView()
+    private let doneButton = NSButton()
 
     init() {
         super.init(
-            contentRect: NSRect(x: 0, y: 0, width: 460, height: 420),
-            styleMask: [.titled, .closable, .miniaturizable],
+            contentRect: NSRect(x: 0, y: 0, width: 620, height: 520),
+            styleMask: [.titled, .closable, .resizable],
             backing: .buffered, defer: false)
-        title = "Name this voice"
+        title = "Who was in this recording?"
         isReleasedWhenClosed = false
+        minSize = NSSize(width: 560, height: 260)
         buildContent()
     }
 
     // MARK: - Presenting
 
-    /// Shown as a sheet on the main window when there is one, so naming
-    /// is part of the app rather than a second window floating loose
-    /// with no obvious relationship to the recording it belongs to.
     func present(item: QueueItem, client: MCPClient, host: NSWindow?) {
         self.item = item
         self.client = client
-        // Unconfirmed guesses first: they are the ones with a wrong
-        // answer already applied to every turn.
-        queue =
-            item.provisionalSpeakers.map(Question.unconfirmed)
-            + item.nameableSpeakers.map(Question.unnamed)
-        index = 0
+        buildRows(for: item)
 
+        // A sheet, and it has to be one.
+        //
+        // A sheet is modal to the window it belongs to, opens centred on
+        // it, and cannot be left behind — which is what this needs,
+        // because naming voices is a flow with a Done at the end.
+        //
+        // The alternative, a titled window run with `NSApp.runModal`,
+        // buys a title bar and a close button and costs everything else.
+        // `present` is reached from inside a `MainActor.run` block, so
+        // `runModal` blocks *the main actor* for the whole session:
+        // every `await` that needs it stops, and the evidence requests
+        // that fill these rows never come back. Sampled while it hung,
+        // the main thread sat in `runModalForWindow:` underneath a
+        // concurrency thunk, and the ten-second mic reconcile had
+        // stopped firing too.
+        //
+        // So: no title bar here. Done and Escape are the way out.
         if let host, host.isVisible {
             if isVisible { orderOut(nil) }
             host.beginSheet(self)
@@ -129,12 +94,11 @@ final class SpeakerNamingWindow: NSWindow, NSTextFieldDelegate {
             makeKeyAndOrderFront(nil)
             NSApp.activate(ignoringOtherApps: true)
         }
-        showCurrent()
+        gatherEvidence()
     }
 
-    /// Close whichever way it was opened.
     private func finish() {
-        player?.stop()
+        stopPlayback()
         if let host = sheetParent {
             host.endSheet(self)
         } else {
@@ -142,461 +106,327 @@ final class SpeakerNamingWindow: NSWindow, NSTextFieldDelegate {
         }
     }
 
-    private var current: Question? {
-        queue.indices.contains(index) ? queue[index] : nil
+    /// Escape. A sheet has no close button and `performClose` does
+    /// nothing on one, so without this the only way out is the button.
+    override func cancelOperation(_ sender: Any?) { finish() }
+
+    /// The red button goes through here rather than through `finish`,
+    /// so a clip left playing would keep playing over a closed window.
+    override func close() {
+        stopPlayback()
+        super.close()
     }
 
-    private func showCurrent() {
-        player?.stop()
-        player = nil
-        evidence = nil
-        candidates.removeAllItems()
-        newName.stringValue = ""
-        newEmail.stringValue = ""
-        searchField.stringValue = ""
-        searchResults.removeAllItems()
-        searchResults.isEnabled = false
-        found = []
-        quote.stringValue = ""
-        setBusy(true)
+    // MARK: - Rows
 
-        guard let speaker = current, let item, let client else {
-            finish()
-            return
-        }
-        selectedPersonID = nil
-        switch speaker {
-        case .unnamed:
-            heading.stringValue =
-                "Voice \(index + 1) of \(queue.count) · \(speaker.turnCount) turns"
-            nameButton.title = "Name"
-        case .unconfirmed(let match):
-            // Say what is already applied and how sure the server is,
-            // because pressing Name here is agreeing to something that
-            // has *already* been written across every turn this voice
-            // spoke — the question is whether to let it stand.
-            let confidence =
-                match.matchPercent.map { "\($0)% \(match.band ?? "match")" }
-                ?? (match.band ?? "a guess")
-            heading.stringValue =
-                "Voice \(index + 1) of \(queue.count) · \(speaker.turnCount) turns "
-                + "· applied as \(match.displayName) on \(confidence)"
-            nameButton.title = "Confirm"
-            // Pre-filled into the field that decides, not held
-            // invisibly somewhere else.
-            newName.stringValue = match.displayName
-            selectedPersonID = match.personID
-        }
-        detail.stringValue = "Gathering evidence…"
-
-        guard let captureID = item.captureID, let cluster = speaker.voiceCluster else {
-            detail.stringValue = "This voice cannot be named from here."
-            setBusy(false)
-            return
-        }
-
-        Task { [weak self] in
-            do {
-                let found = try await client.identifySpeaker(
-                    captureID: captureID, voiceCluster: cluster)
-                await MainActor.run { self?.render(found) }
-            } catch {
-                await MainActor.run { self?.renderFailure(error) }
-            }
-        }
-    }
-
-    private func render(_ found: MCPClient.SpeakerEvidence) {
-        evidence = found
-        setBusy(false)
-        // What the window is actually showing. Without this the only way
-        // to know whether the evidence arrived is to look at the screen,
-        // which is not something a test can do.
-        Log.write(
-            "naming: cluster shows \(found.candidates.count) candidate(s), "
-                + "\(found.spokenNames.count) spoken name(s), "
-                + "\(found.samples.count) clip(s), status \(found.status)")
-
-        // A declined invitee was not in the room. Dropped rather than
-        // shown greyed out — a wrong suggestion costs more than a
-        // missing one.
-        let usable = found.candidates.filter(\.isPlausible)
-        // "Someone else" first and selected, so a suggestion is never
-        // the answer by default. Picking one is an act.
-        candidates.addItem(withTitle: "Nobody yet — type a name below")
-        candidates.lastItem?.representedObject = nil
-        for candidate in usable {
-            candidates.addItem(withTitle: Self.label(for: candidate))
-            candidates.lastItem?.representedObject = candidate.personID
-        }
-        candidates.isEnabled = true
-        candidates.target = self
-        candidates.action = #selector(chooseCandidate)
-        // An unconfirmed guess arrives with its person already in the
-        // field; select the matching row so the window is not showing
-        // two different answers.
-        if let selectedPersonID,
-            let row = candidates.itemArray.firstIndex(where: {
-                $0.representedObject as? Int == selectedPersonID
-            })
-        {
-            candidates.selectItem(at: row)
-        }
-
-        quote.stringValue = found.spokenNames.first.map { "“\($0)”" } ?? ""
-
-        var lines: [String] = []
-        if found.otherRecordings > 0 {
-            lines.append(
-                found.otherRecordings == 1
-                    ? "also in 1 other recording"
-                    : "also in \(found.otherRecordings) other recordings")
-        }
-        if found.status == "provisional" {
-            lines.append("a name is already applied as a guess")
-        }
-        if let sample = found.samples.first, !sample.hasPersistedSnippet {
-            // The server would have to slice the source, which its own
-            // retention may already have purged. Better to say so than
-            // to offer a control that fails with a 404 nobody can read.
-            lines.append("this clip may no longer play")
-        }
-        detail.stringValue = lines.joined(separator: " · ")
-        playButton.isEnabled = !found.samples.isEmpty
-    }
-
-    private func renderFailure(_ error: Error) {
-        setBusy(false)
-        Log.write("naming: could not gather evidence — \(error)")
-        candidates.addItem(withTitle: "Someone else…")
-        if case MCPClient.ClientError.loginRequired(let why) = error {
-            detail.stringValue = "Sign in again — \(why)"
-        } else {
-            detail.stringValue = "Could not gather evidence — \(error)"
-        }
-    }
-
-    private static func label(for candidate: MCPClient.SpeakerCandidate) -> String {
-        var parts = [candidate.displayName]
-        if let percent = candidate.matchPercent, let band = candidate.band {
-            // Percentage *and* band, never one alone: the band is the
-            // server's own judgement of what the number means, and 44%
-            // and 91% must not read alike.
-            parts.append("— \(percent)% \(band)")
-        } else if let rsvp = candidate.rsvp {
-            parts.append("— invited, \(rsvp)")
-        }
-        return parts.joined(separator: " ")
-    }
-
-    /// Copy the chosen suggestion into the name field.
+    /// Unconfirmed first, then unnamed, then settled.
     ///
-    /// The field is the answer — see `chosen`. Before this, a
-    /// suggestion silently outranked whatever was typed below it, so a
-    /// name typed with a suggestion still selected named the suggestion
-    /// instead. Two visible answers, one of them ignored.
-    @objc private func chooseCandidate() {
-        guard let personID = candidates.selectedItem?.representedObject as? Int else {
-            // "Nobody yet" — hand the question back to the field.
-            selectedPersonID = nil
-            return
+    /// Order is by how much the question needs answering. An unconfirmed
+    /// guess is first because a wrong answer is *already applied* to
+    /// every turn that voice spoke; the identified ones are last because
+    /// they are context rather than work.
+    private func buildRows(for item: QueueItem) {
+        stopPlayback()
+        rows.forEach { $0.removeFromSuperview() }
+        rows = []
+        evidenceByKey = [:]
+
+        // Only the unclaimed voices are numbered. Numbering all of them
+        // would put a "4" beside a person's name, which is a label for
+        // the list rather than for them.
+        var unknowns = 0
+        func add(key: String, cluster: Int?, turns: Int, kind: VoiceRow.Kind) {
+            var unknownNumber: Int?
+            if case .unnamed = kind {
+                unknowns += 1
+                unknownNumber = unknowns
+            }
+            let row = VoiceRow(
+                key: key, voiceCluster: cluster, turnCount: turns, kind: kind,
+                unknownNumber: unknownNumber)
+            row.onPlay = { [weak self] in self?.play($0) }
+            row.onPick = { [weak self] in self?.pick($0, personID: $1) }
+            row.onNew = { [weak self] in self?.createPerson(for: $0) }
+            row.onDetach = { [weak self] in self?.detach($0) }
+            rows.append(row)
+            stack.addArrangedSubview(row)
+            row.widthAnchor.constraint(equalTo: stack.widthAnchor).isActive = true
         }
-        selectedPersonID = personID
-        newName.stringValue =
-            candidates.selectedItem?.title.components(separatedBy: " — ").first ?? ""
-        newEmail.stringValue = ""
+
+        for match in item.provisionalSpeakers {
+            add(
+                key: match.key, cluster: match.voiceCluster, turns: match.turnCount,
+                kind: .unconfirmed(
+                    name: match.displayName, percent: match.matchPercent,
+                    band: match.band))
+        }
+        for speaker in item.nameableSpeakers {
+            add(
+                key: speaker.key, cluster: speaker.voiceCluster,
+                turns: speaker.turnCount, kind: .unnamed)
+        }
+        // Anchored names only. An un-anchored one is already above as an
+        // unconfirmed guess, and listing it twice would ask the same
+        // question in two places.
+        let asked = Set(item.provisionalSpeakers.map(\.key))
+        for speaker in item.knownSpeakers
+        where speaker.anchored && !asked.contains(speaker.key) {
+            add(
+                key: speaker.key, cluster: speaker.voiceCluster,
+                turns: speaker.turnCount,
+                kind: .identified(
+                    name: speaker.displayName, percent: speaker.matchPercent))
+        }
+
+        refreshHeading()
     }
 
-    // MARK: - Searching for somebody already known
-
-    @objc private func search() {
-        let query = searchField.stringValue.trimmingCharacters(in: .whitespaces)
-        // Two characters, enforced here as well as in the client: a
-        // one-letter search returns most of the address book, which is
-        // not a dropdown anybody can use.
-        guard query.count >= 2 else {
-            detail.stringValue = "Type at least two characters to search."
+    /// One request per voice, all at once.
+    ///
+    /// Serially would mean the last row in a four-person meeting waits
+    /// for three round trips before it can say anything, and the point
+    /// of showing them together is being able to look at them together.
+    /// Ask the server who each voice might be.
+    ///
+    /// Measured: six voices, all asked at once, all answered about
+    /// **fifteen seconds** later. That is the server's own latency for
+    /// `identify_speaker` — it compares a voiceprint against every
+    /// person it knows — and it is long enough that a row which only
+    /// spins looks broken. So the wait says what it is waiting for.
+    private func gatherEvidence() {
+        guard let item, let client, let captureID = item.captureID else {
+            rows.forEach { $0.unavailable("not uploaded yet") }
             return
         }
-        guard let client else { return }
-
-        searchButton.isEnabled = false
-        searchResults.removeAllItems()
-        searchResults.isEnabled = false
-        detail.stringValue = "Searching…"
-
-        Task { [weak self] in
-            do {
-                let people = try await client.searchPeople(matching: query)
-                await MainActor.run { self?.showResults(people, query: query) }
-            } catch {
-                await MainActor.run {
-                    self?.searchButton.isEnabled = true
-                    if case MCPClient.ClientError.loginRequired(let why) = error {
-                        // Searching needs pa.read, which a token issued
-                        // before this feature does not carry.
-                        self?.detail.stringValue = "Sign in again to search — \(why)"
-                    } else {
-                        self?.detail.stringValue = "Search failed — \(error)"
+        for row in rows {
+            guard let cluster = row.voiceCluster else {
+                row.unavailable("no voice cluster — cannot be named from here")
+                continue
+            }
+            row.showBusy(true)
+            Task { [weak self] in
+                do {
+                    let found = try await client.identifySpeaker(
+                        captureID: captureID, voiceCluster: cluster)
+                    // Kept. Six of these take about fifteen seconds, so
+                    // "is it working or is it stuck?" is a real question
+                    // and this is the only thing that answers it.
+                    Log.write(
+                        "naming: cluster \(cluster) has \(found.candidates.count) "
+                            + "candidate(s), \(found.samples.count) clip(s)")
+                    onMainThread {
+                        self?.evidenceByKey[row.key] = found
+                        row.showBusy(false)
+                        row.offer(found)
+                    }
+                } catch {
+                    onMainThread {
+                        Log.write(
+                            "naming: no evidence for cluster \(cluster) — \(error)")
+                        row.failed(Self.describe(error))
                     }
                 }
             }
         }
     }
 
-    private func showResults(_ people: [MCPClient.Person], query: String) {
-        searchButton.isEnabled = true
-        found = people
-        searchResults.removeAllItems()
+    // MARK: - Playing
 
-        guard !people.isEmpty else {
-            detail.stringValue = "Nobody in Atrium PA matches “\(query)”."
+    private func play(_ row: VoiceRow) {
+        // The same button stops it. Pressing play on the row that is
+        // already sounding is the obvious way to make it stop, so that
+        // is what it does.
+        if row.isPlaying {
+            stopPlayback()
             return
         }
-        for person in people { searchResults.addItem(withTitle: person.label) }
-        searchResults.isEnabled = true
-        searchResults.target = self
-        searchResults.action = #selector(chooseSearchResult)
-        detail.stringValue =
-            people.count == 1
-            ? "1 match — pick it to fill the name below"
-            : "\(people.count) matches — pick one to fill the name below"
-        // Nothing is chosen until it is picked, and picking fills the
-        // field below. The list does not answer for you.
-        chooseSearchResult()
-    }
-
-    /// Typing over a chosen person makes it a different person.
-    ///
-    /// Without this, editing "Alex Rivera" to "Alex Riveras" would
-    /// still name person #5 — the id from the selection would outlive
-    /// the name it belonged to, and the window would show one thing and
-    /// do another.
-    func controlTextDidChange(_ notification: Notification) {
-        guard notification.object as? NSTextField === newName else { return }
-        let typed = newName.stringValue.trimmingCharacters(in: .whitespaces)
-        guard let selectedPersonID else { return }
-        let chosenName =
-            (candidates.selectedItem?.representedObject as? Int == selectedPersonID
-                ? candidates.selectedItem?.title.components(separatedBy: " — ").first
-                : nil)
-            ?? found.first { $0.id == selectedPersonID }?.displayName
-            ?? currentProvisionalName
-        if typed != chosenName {
-            self.selectedPersonID = nil
-            candidates.selectItem(at: 0)
-            searchResults.isEnabled = false
-            detail.stringValue = "Will create a new person called “\(typed)”."
+        guard let client, let sample = evidenceByKey[row.key]?.samples.first else {
+            return
         }
-    }
+        stopPlayback()
 
-    /// The name a provisional guess arrived with, for the comparison
-    /// above.
-    private var currentProvisionalName: String? {
-        if case .unconfirmed(let match) = current { return match.displayName }
-        return nil
-    }
+        playGeneration += 1
+        let generation = playGeneration
+        // Shown before the bytes arrive, because fetching takes long
+        // enough that a button which does not react reads as broken.
+        row.setPlaying(true)
+        playingRow = row
 
-    /// Fill the name field from the search results.
-    @objc private func chooseSearchResult() {
-        guard found.indices.contains(searchResults.indexOfSelectedItem) else { return }
-        let person = found[searchResults.indexOfSelectedItem]
-        selectedPersonID = person.id
-        newName.stringValue = person.displayName
-        newEmail.stringValue = person.email ?? ""
-        // The suggestion list is no longer the answer.
-        candidates.selectItem(at: 0)
-    }
-
-    /// The person the user settled on.
-    ///
-    /// **The name field is the only input.** Every list above it writes
-    /// into that field rather than competing with it, so what the window
-    /// shows is what it will do. This used to be a precedence order —
-    /// search beat suggestions beat the typed name — which meant a name
-    /// typed under a selected suggestion was silently discarded, and the
-    /// window gave no sign of which of its three answers it preferred.
-    private var chosen: (id: Int?, name: String) {
-        let typed = newName.stringValue.trimmingCharacters(in: .whitespaces)
-        // The id only survives while the name still matches the person
-        // it came from; `controlTextDidChange` drops it on any edit.
-        return (selectedPersonID, typed)
-    }
-
-    // MARK: - Actions
-
-    /// What to do when the typed name already belongs to somebody.
-    private enum DuplicateDecision {
-        case use(Int)
-        case createNew
-        case cancel
-    }
-
-    /// Ask the server whether this name already exists, and if so, ask
-    /// the user before creating a second one.
-    ///
-    /// Naming a voice from here created a duplicate person once: a new
-    /// record beside an existing one with the same name, which Atrium PA
-    /// disambiguated by appending the older person's id. The window
-    /// already had a search box that would have found them; nothing
-    /// consulted it when a name was typed by hand.
-    ///
-    /// **A failed search does not block the naming.** The check exists
-    /// to prevent a mess, not to become a new way for the work to fail —
-    /// if the roster cannot be reached, creating is still the answer the
-    /// user asked for. Logged either way, because a duplicate created
-    /// while the search was down should be explicable afterwards.
-    private func existingPerson(
-        named typed: String, using client: MCPClient
-    ) async -> DuplicateDecision {
-        let found: [MCPClient.Person]
-        do {
-            found = try await client.searchPeople(matching: typed)
-        } catch {
-            Log.write(
-                "naming: could not check whether “\(typed)” already exists "
-                    + "(\(error)) — creating anyway")
-            return .createNew
-        }
-
-        let duplicates = PersonMatch.duplicates(of: typed, in: found)
-        guard !duplicates.isEmpty else { return .createNew }
-
-        Log.write(
-            "naming: “\(typed)” already matches "
-                + duplicates.map { "person \($0.id)" }.joined(separator: ", "))
-
-        return await MainActor.run {
-            let alert = NSAlert()
-            alert.alertStyle = .warning
-            alert.messageText = "“\(typed)” already exists"
-            // The consequence is the point. Naming reaches backwards
-            // through every recording a voice appears in, so a duplicate
-            // does not just add a row — it splits one person's history
-            // in two.
-            alert.informativeText =
-                duplicates.count == 1
-                ? "Atrium PA already knows \(duplicates[0].label). Creating a "
-                    + "second one splits this voice's history across both, and "
-                    + "they have to be merged by hand afterwards."
-                : "Atrium PA already knows \(duplicates.count) people with this "
-                    + "name. Creating another makes it harder to tell them apart."
-
-            for candidate in duplicates.prefix(3) {
-                alert.addButton(withTitle: "Use \(candidate.label)")
-            }
-            alert.addButton(withTitle: "Create a new person")
-            alert.addButton(withTitle: "Cancel")
-
-            let choice = alert.runModal()
-            let offered = min(duplicates.count, 3)
-            let index = choice.rawValue - NSApplication.ModalResponse.alertFirstButtonReturn.rawValue
-            if index < offered { return .use(duplicates[index].id) }
-            return index == offered ? .createNew : .cancel
-        }
-    }
-
-    @objc private func play() {
-        guard let sample = evidence?.samples.first, let client else { return }
-        setBusy(true)
         Task { [weak self] in
             do {
                 let data = try await client.fetchSample(sample)
-                await MainActor.run {
-                    self?.setBusy(false)
-                    self?.player = try? AVAudioPlayer(data: data)
-                    self?.player?.play()
+                onMainThread {
+                    guard let self, generation == self.playGeneration else { return }
+                    self.player = try? AVAudioPlayer(data: data)
+                    self.player?.delegate = self
+                    self.player?.play()
                 }
             } catch {
-                await MainActor.run {
-                    self?.setBusy(false)
-                    self?.detail.stringValue = "That clip is no longer available."
+                onMainThread {
+                    guard let self, generation == self.playGeneration else { return }
+                    self.stopPlayback()
+                    row.failed("that clip is no longer available")
                 }
             }
         }
     }
 
-    @objc private func name() {
-        guard let speaker = current, let item, let client,
-            let captureID = item.captureID, let cluster = speaker.voiceCluster
+    /// Silence whatever is sounding and put its button back.
+    private func stopPlayback() {
+        playGeneration += 1
+        player?.stop()
+        player = nil
+        playingRow?.setPlaying(false)
+        playingRow = nil
+    }
+
+    func audioPlayerDidFinishPlaying(_ player: AVAudioPlayer, successfully: Bool) {
+        // A clip that ran to its end leaves a stop button that would do
+        // nothing, which is the same wrong state as one that never
+        // started.
+        DispatchQueue.main.async { [weak self] in self?.stopPlayback() }
+    }
+
+    // MARK: - Naming
+
+    private func pick(_ row: VoiceRow, personID: Int) {
+        let name =
+            row.candidate(forPersonID: personID)?.displayName ?? "person \(personID)"
+        apply(row: row, personID: personID, newPerson: nil, displayName: name)
+    }
+
+    /// Somebody Atrium PA may or may not already know.
+    ///
+    /// The sheet searches as the name is typed and says so in place when
+    /// one already exists, so the duplicate check happens *before* the
+    /// decision rather than as a second dialog after it. Naming a voice
+    /// from this app has created a duplicate person before, and the
+    /// search that would have prevented it was in another window.
+    private func createPerson(for row: VoiceRow) {
+        guard let client else { return }
+        newPersonSheet.present(on: self, client: client) { [weak self] outcome in
+            switch outcome {
+            case .cancel:
+                row.resetChoice()
+            case .use(let personID, let name):
+                self?.apply(
+                    row: row, personID: personID, newPerson: nil, displayName: name)
+            case .create(let name, let email):
+                self?.apply(
+                    row: row, personID: nil, newPerson: name, email: email,
+                    displayName: name)
+            }
+        }
+    }
+
+    private func apply(
+        row: VoiceRow, personID: Int?, newPerson: String?, email: String? = nil,
+        displayName: String
+    ) {
+        guard let item, let client, let captureID = item.captureID,
+            let cluster = row.voiceCluster
         else { return }
 
-        let (personID, displayName) = chosen
-        let typed = displayName
-        guard !typed.isEmpty else {
-            // The field is the answer, so an empty field is no answer —
-            // even if a list above it has a row highlighted.
-            detail.stringValue =
-                "Type a name, or pick somebody above to fill it in."
-            return
-        }
-
-        setBusy(true)
-        let summary = evidenceSummary(personID: personID)
-        let email = newEmail.stringValue.trimmingCharacters(in: .whitespaces)
-        let key = speaker.key
+        row.showBusy(true)
+        let summary = evidenceSummary(for: row, personID: personID)
 
         Task { [weak self] in
-            // Creating a person is the only path that can make a mess
-            // the app cannot clean up, so it is the only one that asks
-            // first. Picking somebody from the roster already names an
-            // existing person and needs no check.
-            var resolvedPersonID = personID
-            if personID == nil {
-                switch await self?.existingPerson(named: typed, using: client) {
-                case .some(.cancel):
-                    await MainActor.run { self?.setBusy(false) }
-                    return
-                case .some(.use(let existing)):
-                    resolvedPersonID = existing
-                case .some(.createNew), .none:
-                    break
-                }
-            }
+            let resolved = personID
             do {
                 let result = try await client.nameSpeaker(
-                    captureID: captureID, voiceCluster: cluster,
-                    personID: resolvedPersonID,
-                    newPerson: resolvedPersonID == nil
-                        ? (typed, email.isEmpty ? nil : email) : nil,
+                    captureID: captureID, voiceCluster: cluster, personID: resolved,
+                    newPerson: resolved == nil ? (displayName, email) : nil,
                     evidence: summary)
-                await MainActor.run {
-                    // Logged as well as shown. Otherwise there is no way
+                onMainThread {
+                    // Logged as well as shown: otherwise there is no way
                     // to tell afterwards whether a voice was named from
-                    // here or from the web UI — and that is the first
+                    // here or in the web UI, and that is the first
                     // question asked when a name turns out to be wrong.
                     Log.write(
                         "naming: named cluster \(cluster) as "
-                            + (resolvedPersonID.map { "person \($0)" }
-                                ?? "new person “\(typed)”")
+                            + (resolved.map { "person \($0)" }
+                                ?? "new person “\(displayName)”")
                             + " — \(result.turnsUpdated) turn(s), "
                             + "\(result.recordingsAffected) recording(s)")
+                    row.showBusy(false)
                     // The blast radius is the point: naming reaches
                     // backwards through every recording this voice is in.
-                    self?.detail.stringValue =
-                        "Named — \(result.turnsUpdated) turns across "
-                        + "\(result.recordingsAffected) recording(s)"
-                    self?.onResolved?(
-                        key, resolvedPersonID == nil ? typed : displayName)
-                    self?.advance()
+                    row.settled(
+                        as: displayName, turns: result.turnsUpdated,
+                        recordings: result.recordingsAffected)
+                    self?.onResolved?(row.key, displayName)
+                    self?.refreshHeading()
                 }
             } catch {
-                await MainActor.run {
+                onMainThread {
                     Log.write("naming: could not name cluster \(cluster) — \(error)")
-                    self?.setBusy(false)
-                    self?.detail.stringValue = "Could not name — \(error)"
+                    row.showBusy(false)
+                    row.resetChoice()
+                    row.failed("could not name — \(Self.describe(error))")
                 }
             }
         }
+    }
+
+    /// Take the name back off a voice.
+    ///
+    /// Confirmed first, because it is not local: `unname_speaker` is
+    /// addressed by voice cluster rather than by capture, so it reaches
+    /// backwards through every recording that voice appears in — the
+    /// same blast radius naming has, in the other direction.
+    private func detach(_ row: VoiceRow) {
+        guard let client, let cluster = row.voiceCluster else { return }
+
+        let alert = NSAlert()
+        alert.alertStyle = .warning
+        alert.messageText = "Detach this voice from \(row.currentName)?"
+        alert.informativeText =
+            "The name comes off this voiceprint everywhere it appears, not "
+            + "only in this recording. It can be named again afterwards."
+        alert.addButton(withTitle: "Detach")
+        alert.addButton(withTitle: "Cancel")
+        guard alert.runModal() == .alertFirstButtonReturn else { return }
+
+        row.showBusy(true)
+        Task { [weak self] in
+            do {
+                try await client.unnameSpeaker(voiceCluster: cluster)
+                onMainThread {
+                    Log.write("naming: detached cluster \(cluster)")
+                    row.showBusy(false)
+                    row.detached(unknownNumber: nil)
+                    // The badge counted this voice as answered; it is a
+                    // question again.
+                    self?.onResolved?(row.key, nil)
+                    self?.refreshHeading()
+                }
+            } catch {
+                onMainThread {
+                    Log.write("naming: could not detach cluster \(cluster) — \(error)")
+                    row.showBusy(false)
+                    row.failed("could not detach — \(Self.describe(error))")
+                }
+            }
+        }
+    }
+
+    private func refreshHeading() {
+        let open = rows.filter(\.isActionable).count
+        let voices = rows.count == 1 ? "voice" : "voices"
+        heading.stringValue =
+            open == 0
+            ? "\(rows.count) \(voices) — nothing left to name"
+            : "\(open) of \(rows.count) \(voices) still "
+                + (open == 1 ? "needs" : "need") + " a name"
     }
 
     /// What the decision actually rested on, stored server-side.
     ///
     /// Not decoration: it is what someone reads later when they wonder
-    /// why this voice is called this. So it says what was true, not
-    /// "named from atrium-mac".
-    private func evidenceSummary(personID: Int?) -> String {
+    /// why this voice is called this. So it says what was true.
+    private func evidenceSummary(for row: VoiceRow, personID: Int?) -> String {
         var parts: [String] = []
+        let evidence = evidenceByKey[row.key]
         if let match = evidence?.candidates.first(where: { $0.personID == personID }),
             let percent = match.matchPercent, let band = match.band
         {
@@ -605,180 +435,128 @@ final class SpeakerNamingWindow: NSWindow, NSTextFieldDelegate {
         if let spoken = evidence?.spokenNames.first {
             parts.append("named aloud: “\(spoken)”")
         }
-        if let rsvp = evidence?.candidates.first(where: { $0.personID == personID })?.rsvp {
+        if let rsvp = evidence?.candidates
+            .first(where: { $0.personID == personID })?.rsvp
+        {
             parts.append("invitee (\(rsvp))")
         }
         parts.append("confirmed by the operator in Atrium PA Capture")
         return parts.joined(separator: "; ")
     }
 
-    @objc private func skip() {
-        guard let speaker = current, let item, let client,
-            let captureID = item.captureID, let cluster = speaker.voiceCluster
-        else { return }
-        let key = speaker.key
-        Task { [weak self] in
-            do {
-                try await client.dismissSpeaker(voiceCluster: cluster)
-                Log.write("naming: dismissed cluster \(cluster)")
-            } catch {
-                Log.write("naming: could not dismiss cluster \(cluster) — \(error)")
-            }
-            await MainActor.run {
-                self?.onResolved?(key, nil)
-                self?.advance()
-            }
+    private static func describe(_ error: Error) -> String {
+        if case MCPClient.ClientError.loginRequired(let why) = error {
+            return "sign in again — \(why)"
         }
-    }
-
-    @objc private func later() {
-        finish()
-    }
-
-    /// Escape. A sheet has no close button and `performClose` does
-    /// nothing on one, so without this the only way out was the "Not
-    /// now" button — and a window you cannot dismiss with the key
-    /// everybody reaches for feels stuck.
-    override func cancelOperation(_ sender: Any?) {
-        finish()
-    }
-
-    private func advance() {
-        index += 1
-        if current == nil {
-            finish()
-        } else {
-            showCurrent()
-        }
-    }
-
-    private func setBusy(_ busy: Bool) {
-        if busy { spinner.startAnimation(nil) } else { spinner.stopAnimation(nil) }
-        spinner.isHidden = !busy
-        nameButton.isEnabled = !busy
-        skipButton.isEnabled = !busy
+        return "\(error)"
     }
 
     // MARK: - Layout
 
     private func buildContent() {
-        let view = NSView(frame: NSRect(x: 0, y: 0, width: 460, height: 420))
+        let view = NSView()
 
-        heading.frame = NSRect(x: 20, y: 376, width: 390, height: 20)
         heading.font = .systemFont(ofSize: 13, weight: .semibold)
+        heading.translatesAutoresizingMaskIntoConstraints = false
         view.addSubview(heading)
 
-        playButton.frame = NSRect(x: 20, y: 336, width: 110, height: 28)
-        playButton.title = "▶ Listen"
-        playButton.bezelStyle = .rounded
-        playButton.target = self
-        playButton.action = #selector(play)
-        playButton.isEnabled = false
-        view.addSubview(playButton)
+        // Outside the scroll view on purpose: a header that scrolls
+        // away stops being a header the moment the list is long enough
+        // to need one.
+        let voiceHeader = Self.columnHeader("Voice", width: VoiceRow.Columns.name)
+        voiceHeader.setContentHuggingPriority(.init(1), for: .horizontal)
+        let header = NSStackView(views: [
+            voiceHeader,
+            Self.columnHeader("", width: VoiceRow.Columns.spinner),
+            Self.columnHeader("", width: VoiceRow.Columns.play),
+            Self.columnHeader("", width: VoiceRow.Columns.newButton),
+            Self.columnHeader("", width: VoiceRow.Columns.detach),
+            Self.columnHeader("Identify as", width: VoiceRow.Columns.choices),
+        ])
+        header.orientation = .horizontal
+        header.alignment = .firstBaseline
+        header.spacing = VoiceRow.Columns.spacing
+        header.translatesAutoresizingMaskIntoConstraints = false
+        view.addSubview(header)
 
-        spinner.frame = NSRect(x: 142, y: 340, width: 18, height: 18)
-        spinner.style = .spinning
-        spinner.isDisplayedWhenStopped = false
-        view.addSubview(spinner)
+        let rule = NSBox()
+        rule.boxType = .separator
+        rule.translatesAutoresizingMaskIntoConstraints = false
+        view.addSubview(rule)
 
-        quote.frame = NSRect(x: 20, y: 304, width: 420, height: 20)
-        quote.font = .systemFont(ofSize: 12)
-        quote.textColor = .secondaryLabelColor
-        quote.lineBreakMode = .byTruncatingTail
-        view.addSubview(quote)
+        stack.orientation = .vertical
+        stack.alignment = .leading
+        stack.spacing = 10
+        // Hug upwards. Without this a list shorter than the window
+        // spreads its rows down the whole height, which reads as a
+        // layout accident rather than a short list.
+        stack.setHuggingPriority(.defaultHigh, for: .vertical)
+        stack.translatesAutoresizingMaskIntoConstraints = false
 
-        detail.frame = NSRect(x: 20, y: 280, width: 420, height: 20)
-        detail.font = .systemFont(ofSize: 11)
-        detail.textColor = .tertiaryLabelColor
-        detail.lineBreakMode = .byTruncatingTail
-        view.addSubview(detail)
+        // A flipped container, or the list sits at the *bottom* of the
+        // scroll view and fills the space above it with nothing. AppKit
+        // measures from the bottom-left unless told otherwise, and a
+        // stack view cannot be flipped, so the document view is a
+        // wrapper that can be — this is why the rows appeared halfway
+        // down an empty window.
+        let document = FlippedView()
+        document.translatesAutoresizingMaskIntoConstraints = false
+        document.addSubview(stack)
+        scroll.documentView = document
+        scroll.hasVerticalScroller = true
+        scroll.drawsBackground = false
+        scroll.translatesAutoresizingMaskIntoConstraints = false
+        view.addSubview(scroll)
 
-        view.addSubview(label("Suggestions — pick one to fill the name", y: 248))
-        candidates.frame = NSRect(x: 20, y: 218, width: 420, height: 26)
-        view.addSubview(candidates)
+        doneButton.title = "Done"
+        doneButton.bezelStyle = .rounded
+        doneButton.keyEquivalent = "\r"
+        doneButton.target = self
+        doneButton.action = #selector(done)
+        doneButton.translatesAutoresizingMaskIntoConstraints = false
+        view.addSubview(doneButton)
 
-        view.addSubview(label("Search Atrium PA — pick one to fill the name", y: 188))
-        searchField.frame = NSRect(x: 20, y: 158, width: 320, height: 24)
-        searchField.placeholderString = "Name (at least 2 characters)"
-        // Return in the field searches rather than naming: pressing
-        // Enter after typing a name should look it up, not commit a new
-        // person with that name.
-        searchField.target = self
-        searchField.action = #selector(search)
-        view.addSubview(searchField)
+        NSLayoutConstraint.activate([
+            heading.leadingAnchor.constraint(equalTo: view.leadingAnchor, constant: 20),
+            heading.trailingAnchor.constraint(equalTo: view.trailingAnchor, constant: -20),
+            heading.topAnchor.constraint(equalTo: view.topAnchor, constant: 18),
 
-        searchButton.frame = NSRect(x: 348, y: 156, width: 92, height: 28)
-        searchButton.title = "Search"
-        searchButton.bezelStyle = .rounded
-        searchButton.target = self
-        searchButton.action = #selector(search)
-        view.addSubview(searchButton)
+            scroll.leadingAnchor.constraint(equalTo: view.leadingAnchor, constant: 20),
+            scroll.trailingAnchor.constraint(equalTo: view.trailingAnchor, constant: -20),
+            header.leadingAnchor.constraint(equalTo: view.leadingAnchor, constant: 20),
+            header.trailingAnchor.constraint(equalTo: view.trailingAnchor, constant: -20),
+            header.topAnchor.constraint(equalTo: heading.bottomAnchor, constant: 14),
+            rule.leadingAnchor.constraint(equalTo: view.leadingAnchor, constant: 20),
+            rule.trailingAnchor.constraint(equalTo: view.trailingAnchor, constant: -20),
+            rule.topAnchor.constraint(equalTo: header.bottomAnchor, constant: 4),
 
-        searchResults.frame = NSRect(x: 20, y: 126, width: 420, height: 26)
-        searchResults.isEnabled = false
-        view.addSubview(searchResults)
+            scroll.topAnchor.constraint(equalTo: rule.bottomAnchor, constant: 8),
+            scroll.bottomAnchor.constraint(equalTo: doneButton.topAnchor, constant: -12),
 
-        view.addSubview(label("This voice is:", y: 98))
-        newName.frame = NSRect(x: 20, y: 68, width: 200, height: 24)
-        newName.placeholderString = "Full name"
-        newName.delegate = self
-        view.addSubview(newName)
-        newEmail.frame = NSRect(x: 228, y: 68, width: 212, height: 24)
-        newEmail.placeholderString = "Email (optional)"
-        view.addSubview(newEmail)
+            document.leadingAnchor.constraint(equalTo: scroll.contentView.leadingAnchor),
+            document.topAnchor.constraint(equalTo: scroll.contentView.topAnchor),
+            document.widthAnchor.constraint(equalTo: scroll.contentView.widthAnchor),
+            stack.leadingAnchor.constraint(equalTo: document.leadingAnchor),
+            stack.trailingAnchor.constraint(equalTo: document.trailingAnchor),
+            stack.topAnchor.constraint(equalTo: document.topAnchor),
+            stack.bottomAnchor.constraint(equalTo: document.bottomAnchor),
 
-        // A sheet draws no title bar, so it has no close button unless
-        // one is put there.
-        let close = NSButton(frame: NSRect(x: 424, y: 388, width: 20, height: 20))
-        close.bezelStyle = .circular
-        close.isBordered = false
-        close.image = NSImage(
-            systemSymbolName: "xmark.circle.fill", accessibilityDescription: "Close")
-        close.contentTintColor = .secondaryLabelColor
-        close.target = self
-        close.action = #selector(later)
-        close.toolTip = "Close — the voices stay on the list"
-        view.addSubview(close)
-
-        laterButton.frame = NSRect(x: 20, y: 20, width: 90, height: 30)
-        laterButton.title = "Not now"
-        // The canonical escape route. `cancelOperation` covers the case
-        // where the window itself is first responder; a button carrying
-        // the escape key equivalent covers the case where a text field
-        // is, which is most of the time here.
-        laterButton.keyEquivalent = "\u{1b}"
-        laterButton.bezelStyle = .rounded
-        laterButton.target = self
-        laterButton.action = #selector(later)
-        view.addSubview(laterButton)
-
-        skipButton.frame = NSRect(x: 116, y: 20, width: 130, height: 30)
-        skipButton.title = "Skip this voice"
-        skipButton.bezelStyle = .rounded
-        skipButton.target = self
-        skipButton.action = #selector(skip)
-        skipButton.toolTip =
-            "Stop being asked about this voice. Nothing is deleted, and "
-            + "pressing “Name voices…” on this recording again offers to bring "
-            + "it back."
-        view.addSubview(skipButton)
-
-        nameButton.frame = NSRect(x: 352, y: 20, width: 88, height: 30)
-        nameButton.title = "Name"
-        nameButton.bezelStyle = .rounded
-        nameButton.keyEquivalent = "\r"
-        nameButton.target = self
-        nameButton.action = #selector(name)
-        view.addSubview(nameButton)
-
+            doneButton.trailingAnchor.constraint(
+                equalTo: view.trailingAnchor, constant: -20),
+            doneButton.bottomAnchor.constraint(equalTo: view.bottomAnchor, constant: -16),
+            doneButton.widthAnchor.constraint(equalToConstant: 90),
+        ])
         contentView = view
     }
 
-    private func label(_ text: String, y: CGFloat) -> NSTextField {
-        let field = NSTextField(labelWithString: text)
-        field.frame = NSRect(x: 20, y: y, width: 420, height: 16)
-        field.font = .systemFont(ofSize: 11, weight: .medium)
+    private static func columnHeader(_ title: String, width: CGFloat) -> NSView {
+        let field = NSTextField(labelWithString: title.uppercased())
+        field.font = .systemFont(ofSize: 10, weight: .bold)
         field.textColor = .secondaryLabelColor
+        field.translatesAutoresizingMaskIntoConstraints = false
+        field.widthAnchor.constraint(greaterThanOrEqualToConstant: width).isActive = true
         return field
     }
+
+    @objc private func done() { finish() }
 }

@@ -1016,7 +1016,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     private func presentNaming(resolved item: QueueItem) {
-        guard item.openSpeakerQuestions > 0 else {
+        // Any cast at all is worth showing, not only the awkward parts.
+        //
+        // This used to require an *unanswered* question, which was right
+        // when the window asked about one voice at a time: no question,
+        // no window. The window now lists everybody in the recording and
+        // is the only place a name can be taken back off — so refusing
+        // to open it once everything was named left no way to correct a
+        // mistake, and said "no unnamed voices" as though that were the
+        // only reason to look.
+        guard item.openSpeakerQuestions > 0 || !item.knownSpeakers.isEmpty else {
             offerToRestoreDismissed(in: item)
             return
         }

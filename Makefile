@@ -315,7 +315,15 @@ notarize: bundle
 appcast:
 	@mkdir -p "$(APPCAST_DIR)" build/appcast
 	@cp "$(DMG)" build/appcast/ 2>/dev/null || true
-	@$(SPARKLE_DIR)/bin/generate_appcast build/appcast \
+	@# No binary deltas.
+	@#
+	@# They are a real saving — 132 KB against 2.7 MB — and they cost a
+	@# second asset per release that has to be uploaded and URL-rewritten
+	@# alongside the image. For a personal app updating a handful of
+	@# installs, 2.7 MB is not worth the extra moving part, and a delta
+	@# that fails falls back to the full download silently, which means a
+	@# broken one is invisible. Raise this if the image ever gets big.
+	@$(SPARKLE_DIR)/bin/generate_appcast build/appcast --maximum-deltas 0 \
 		--download-url-prefix "https://github.com/$(REPO)/releases/download/PLACEHOLDER/"
 	@python3 Tools/fix-appcast.py build/appcast/appcast.xml "$(APPCAST_DIR)/appcast.xml" \
 		"https://github.com/$(REPO)/releases/download"

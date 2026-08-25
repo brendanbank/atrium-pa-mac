@@ -21,18 +21,36 @@ ET.register_namespace("sparkle", SPARKLE)
 
 source, destination, base = sys.argv[1], sys.argv[2], sys.argv[3].rstrip("/")
 
+PLACEHOLDER = "PLACEHOLDER"
+
 tree = ET.parse(source)
 rewritten = 0
 for item in tree.getroot().iter("item"):
     version = item.findtext(f"{{{SPARKLE}}}shortVersionString")
-    enclosure = item.find("enclosure")
-    if version is None or enclosure is None:
+    if version is None:
         continue
-    filename = enclosure.get("url", "").rsplit("/", 1)[-1]
-    if not filename:
-        continue
-    enclosure.set("url", f"{base}/v{version}/{filename}")
-    rewritten += 1
+    # Every enclosure under this item, not just the direct child. A
+    # delta lives inside <sparkle:deltas>, and the first version of this
+    # script rewrote only the top-level one — leaving "PLACEHOLDER" in
+    # the delta's URL. Sparkle would have tried it, failed, and fallen
+    # back to the full download, so the feed would have looked fine.
+    for enclosure in item.iter("enclosure"):
+        filename = enclosure.get("url", "").rsplit("/", 1)[-1]
+        if not filename:
+            continue
+        enclosure.set("url", f"{base}/v{version}/{filename}")
+        rewritten += 1
 
 tree.write(destination, encoding="utf-8", xml_declaration=True)
-print(f"appcast: {rewritten} release(s), pointed at {base}/v<version>/")
+
+# Refuse to publish a feed with an unrewritten URL in it. A broken
+# enclosure degrades quietly rather than failing, which is the kind of
+# thing that ships.
+published = open(destination, encoding="utf-8").read()
+if PLACEHOLDER in published:
+    sys.exit(
+        f"appcast: {PLACEHOLDER} survived the rewrite — refusing to publish "
+        f"a feed with a URL that cannot resolve"
+    )
+
+print(f"appcast: {rewritten} enclosure(s), pointed at {base}/v<version>/")

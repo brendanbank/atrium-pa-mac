@@ -654,6 +654,56 @@ enum UnitTests {
                 "a source label claimed to be human-supplied — it would be sent")
         }
 
+        h.test("the server's title is what the list shows") {
+            // The app sends no title, so the server derives one from the
+            // transcript. Not reading it back left the list showing
+            // "Teams meeting" for ever while the server knew the meeting
+            // was about the CFO situation.
+            var item = QueueItem(
+                id: UUID(), audioFile: "a.m4a", masterFiles: [],
+                title: "Teams meeting", occurredAt: Date(), language: nil,
+                sizeBytes: 1, state: .ready, captureID: 1, transcriptID: 2,
+                attempts: 0, nextAttemptAt: .distantPast, lastError: nil,
+                enqueuedAt: Date(), completedAt: nil, unknownSpeakers: [],
+                notifiedAt: nil, namedSpeakers: [])
+            try expectEqual(item.displayTitle, "Teams meeting", "no server title yet")
+            item.serverTitle = "CBO-probleem en CFO-situatie"
+            try expectEqual(
+                item.displayTitle, "CBO-probleem en CFO-situatie",
+                "the source label won over the server's title")
+        }
+
+        h.test("a title a person typed outranks a generated one") {
+            var item = QueueItem(
+                id: UUID(), audioFile: "a.m4a", masterFiles: [],
+                title: "Board review", titleIsHumanSupplied: true,
+                occurredAt: Date(), language: nil, sizeBytes: 1, state: .ready,
+                captureID: 1, transcriptID: 2, attempts: 0,
+                nextAttemptAt: .distantPast, lastError: nil, enqueuedAt: Date(),
+                completedAt: nil, unknownSpeakers: [], notifiedAt: nil,
+                namedSpeakers: [])
+            item.serverTitle = "Quarterly numbers and hiring"
+            try expectEqual(
+                item.displayTitle, "Board review",
+                "a generated title overrode one somebody typed")
+        }
+
+        h.test("an old queue file has no server title and still reads") {
+            let json = """
+                {"id":"\(UUID().uuidString)","audioFile":"a.m4a","masterFiles":[],
+                 "title":"Teams meeting","occurredAt":"2026-08-24T09:05:44Z",
+                 "sizeBytes":1,"state":"ready","attempts":0,
+                 "nextAttemptAt":"2026-08-24T09:05:44Z",
+                 "enqueuedAt":"2026-08-24T09:05:44Z","unknownSpeakers":[],
+                 "namedSpeakers":[]}
+                """
+            let decoder = JSONDecoder()
+            decoder.dateDecodingStrategy = .iso8601
+            let item = try decoder.decode(QueueItem.self, from: Data(json.utf8))
+            try expect(item.serverTitle == nil, "invented a server title")
+            try expectEqual(item.displayTitle, "Teams meeting", "fallback lost")
+        }
+
         h.test("a title a person supplied is sent") {
             let item = QueueItem(
                 id: UUID(), audioFile: "a.m4a", masterFiles: [],

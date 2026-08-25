@@ -723,13 +723,43 @@ public actor MCPClient {
         }
     }
 
-    /// Who the server says was in this recording.
-    public func speakers(transcriptID: Int) async throws -> [TranscriptSpeaker] {
+    /// What the server knows about a recording: its title and its cast.
+    ///
+    /// Both come out of one `get_transcript`, which is why they are
+    /// fetched together rather than by two calls that would say the
+    /// same thing twice.
+    public struct TranscriptDetails: Equatable {
+        /// The server's own title, derived from the transcript.
+        ///
+        /// This app deliberately sends none — a label naming the app
+        /// that did the capturing answers a different question than the
+        /// field asks. Reading this back is the other half of that
+        /// decision: without it the recordings list shows the local
+        /// source label for ever and never learns what the meeting was
+        /// actually about.
+        public let title: String?
+        public let speakers: [TranscriptSpeaker]
+    }
+
+    public func transcriptDetails(transcriptID: Int) async throws -> TranscriptDetails {
         let payload = try await call(
             tool: "get_transcript",
             arguments: ["transcript_id": transcriptID, "summary_max_chars": 0])
 
-        return (payload["speakers"] as? [[String: Any]] ?? []).map { row in
+        let title = (payload["title"] as? String)?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        return TranscriptDetails(
+            title: (title?.isEmpty ?? true) ? nil : title,
+            speakers: Self.roster(from: payload))
+    }
+
+    /// Who the server says was in this recording.
+    public func speakers(transcriptID: Int) async throws -> [TranscriptSpeaker] {
+        try await transcriptDetails(transcriptID: transcriptID).speakers
+    }
+
+    private static func roster(from payload: [String: Any]) -> [TranscriptSpeaker] {
+        (payload["speakers"] as? [[String: Any]] ?? []).map { row in
             TranscriptSpeaker(
                 key: row["key"] as? String ?? "Speaker",
                 voiceCluster: row["voice_cluster_id"] as? Int,

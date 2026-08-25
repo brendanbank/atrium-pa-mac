@@ -549,7 +549,7 @@ extension ActivityWindow: NSTableViewDataSource, NSTableViewDelegate {
             formatter.dateFormat = "d MMM HH:mm"
             text = formatter.string(from: item.occurredAt)
         case "meeting":
-            text = item.title ?? "Recording"
+            text = item.displayTitle
         case "status":
             text = item.statusDescription
             switch item.state {

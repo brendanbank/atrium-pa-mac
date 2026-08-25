@@ -1748,9 +1748,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 let data = try await client.fetchExport(export)
                 let document = try TranscriptDocument(data: data)
                 let format = self?.config.transcriptFormat ?? .markdown
+                // The document's own title, not the local one. The
+                // local title names the app that did the capturing, so
+                // it filed every Teams call as "Teams meeting.md" and
+                // they overwrote each other in Downloads. Only a title
+                // a person typed beats the transcript's own.
                 let name = TranscriptDocument.filename(
-                    title: item.title ?? document.title, occurredAt: item.occurredAt,
-                    format: format)
+                    title: item.titleIsHumanSupplied
+                        ? (item.title ?? document.title) : document.title,
+                    occurredAt: item.occurredAt, format: format)
                 let destination = try FileManager.default.url(
                     for: .downloadsDirectory, in: .userDomainMask,
                     appropriateFor: nil, create: true

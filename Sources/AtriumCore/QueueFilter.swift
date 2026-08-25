@@ -99,7 +99,11 @@ public struct QueueFilter {
     /// including a speaker's name, which is often the only thing anyone
     /// remembers about a meeting.
     static func haystack(for item: QueueItem) -> String {
+        // Both titles are searchable. The server's says what the
+        // meeting was about and the local one says which app captured
+        // it, and somebody may well remember either.
         var parts = [
+            item.displayTitle,
             item.title ?? "Recording",
             searchableDate.string(from: item.occurredAt),
             item.statusDescription,

@@ -51,6 +51,22 @@ public struct QueueItem: Codable, Equatable {
     /// (`20260824-090544-modulehost.m4a`), which the server keeps.
     public var titleIsHumanSupplied: Bool = false
 
+    /// The title Atrium PA derived, once there is a transcript.
+    ///
+    /// The other half of not sending one. This app deliberately sends no
+    /// title, because a label naming the capturing app answers a
+    /// different question than the field asks — so the server generates
+    /// one from the transcript, and it is a description of the
+    /// conversation. Without reading it back, the list would show
+    /// "Teams meeting" for ever while the server knew the meeting was
+    /// about the CFO situation.
+    ///
+    /// Kept separate from `title` rather than overwriting it: `title` is
+    /// what this Mac decided to call the recording, and the two
+    /// disagreeing is not a conflict to resolve — one is the source, the
+    /// other is the subject.
+    public var serverTitle: String?
+
     public var occurredAt: Date
     public var language: String?
     public var sizeBytes: Int
@@ -197,6 +213,7 @@ public struct QueueItem: Codable, Equatable {
         // retry of an old queue file.
         titleIsHumanSupplied =
             try c.decodeIfPresent(Bool.self, forKey: .titleIsHumanSupplied) ?? false
+        serverTitle = try c.decodeIfPresent(String.self, forKey: .serverTitle)
         directory = try c.decodeIfPresent(String.self, forKey: .directory)
         provisionalSpeakers =
             try c.decodeIfPresent(
@@ -207,6 +224,18 @@ public struct QueueItem: Codable, Equatable {
     }
 
     /// What the activity window shows in the Status column.
+    /// What to call this recording on screen.
+    ///
+    /// The server's title wins when there is one: it says what the
+    /// meeting was about, where the local one only says which app was
+    /// holding the microphone.
+    public var displayTitle: String {
+        // A name somebody typed outranks a generated one — they knew
+        // something the transcript did not.
+        if titleIsHumanSupplied, let title, !title.isEmpty { return title }
+        return serverTitle ?? title ?? "Recording"
+    }
+
     public var statusDescription: String {
         switch state {
         case .pending: return lastError == nil ? "waiting to upload" : "retrying"
@@ -555,12 +584,20 @@ public actor UploadQueue {
     /// the one-off catch-up, run at startup, bounded to items that have
     /// nothing at all.
     private func backfillRosters(using client: MCPClient) async {
+        // Missing a roster **or** missing the server's title. Both come
+        // from one `get_transcript`, and both are absent on everything
+        // recorded before this app learned to ask for them — the
+        // follow-up window is 30 minutes after completion, so nothing
+        // older is ever revisited and a recordings list would show
+        // "Teams meeting" for the rest of its life.
         let missing = items.values.filter {
             $0.state == .ready && $0.captureID != nil && $0.transcriptID != nil
-                && $0.knownSpeakers.isEmpty
+                && ($0.knownSpeakers.isEmpty || $0.serverTitle == nil)
         }
         guard !missing.isEmpty else { return }
-        Log.write("queue: reading the speaker roster for \(missing.count) recording(s)")
+        Log.write(
+            "queue: reading the title and speaker roster for "
+                + "\(missing.count) recording(s)")
         for item in missing {
             lastSpeakerCheck[item.id] = Date()
             await refreshSpeakers(itemID: item.id)
@@ -624,8 +661,12 @@ public actor UploadQueue {
             // Names applied as a guess live in `speakers[]`, not in
             // `unknown_speakers[]`, so they need their own question.
             var roster: [MCPClient.TranscriptSpeaker] = []
+            var serverTitle: String?
             if let transcriptID = item.transcriptID {
-                roster = (try? await client.speakers(transcriptID: transcriptID)) ?? []
+                let details = try? await client.transcriptDetails(
+                    transcriptID: transcriptID)
+                roster = details?.speakers ?? []
+                serverTitle = details?.title
             }
             let provisional: [MCPClient.ProvisionalMatch] = roster
                 .filter(\.isProvisional)
@@ -641,6 +682,16 @@ public actor UploadQueue {
                 }
 
             guard var current = items[itemID] else { return nil }
+            // A title can change after it is first written — the server
+            // may refine it, or somebody may rename the capture — so
+            // this follows rather than being set once.
+            if let serverTitle, current.serverTitle != serverTitle {
+                Log.write(
+                    "queue: capture \(captureID) is titled “\(serverTitle)”")
+                current.serverTitle = serverTitle
+                items[itemID] = current
+                persist(current)
+            }
             if current.knownSpeakers != roster {
                 Log.write(
                     "queue: capture \(captureID) roster is now "

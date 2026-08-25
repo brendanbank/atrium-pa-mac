@@ -132,8 +132,6 @@ let harness = Harness()
 let productionLog = FileManager.default
     .urls(for: .libraryDirectory, in: .userDomainMask)[0]
     .appending(path: "Logs/AtriumMac.log")
-let productionLogBefore = try? FileManager.default
-    .attributesOfItem(atPath: productionLog.path)[.modificationDate] as? Date
 
 let testLogRoot = FileManager.default.temporaryDirectory
     .appending(path: "atrium-selftest-logs-\(UUID().uuidString)")
@@ -156,14 +154,19 @@ if wantsLive {
 }
 
 // The guard, not just the redirect. A redirect that silently lapses is
-// how this got shipped in the first place, so the run fails if the real
-// log was touched at all.
-let productionLogAfter = try? FileManager.default
-    .attributesOfItem(atPath: productionLog.path)[.modificationDate] as? Date
-if productionLogBefore != productionLogAfter {
+// how this got shipped in the first place.
+//
+// It asks where `Log` is pointing, not whether the file changed. The
+// first version compared the production log's modification date across
+// the run and failed if it moved — which it does whenever the app is
+// running, because the app writes to that file too. A guard that fails
+// for a reason having nothing to do with the thing it guards is a guard
+// somebody deletes. Since `Log.fileURL` is the only writer, asking it
+// directly is both deterministic and sufficient.
+if Log.fileURL == productionLog || Log.fileURLOverride == nil {
     print("")
     print(
-        "\u{001B}[31mFAIL\u{001B}[0m  the self-test wrote to "
+        "\u{001B}[31mFAIL\u{001B}[0m  Log is pointing at "
             + "~/Library/Logs/AtriumMac.log — fixture output would be read as "
             + "something that happened")
     exit(1)

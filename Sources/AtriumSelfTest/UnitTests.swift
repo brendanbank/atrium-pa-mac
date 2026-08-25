@@ -633,6 +633,60 @@ enum UnitTests {
     // MARK: - SessionController
 
     private static func sessions(_ h: Harness) {
+        h.group("upload_audio — a source label is not a title")
+
+        h.test("a source-derived title is kept locally and not sent") {
+            // The server treats `title` as what the recording is about,
+            // and weights it above the body in search. "Teams meeting"
+            // answers a different question, so it stays on this Mac.
+            let item = QueueItem(
+                id: UUID(), audioFile: "a.m4a", masterFiles: [],
+                title: MeetingTitle.title(
+                    bundleID: "com.microsoft.teams2.helper", isManual: false),
+                occurredAt: Date(), language: nil, sizeBytes: 1, state: .pending,
+                captureID: nil, transcriptID: nil, attempts: 0,
+                nextAttemptAt: .distantPast, lastError: nil, enqueuedAt: Date(),
+                completedAt: nil, unknownSpeakers: [], notifiedAt: nil,
+                namedSpeakers: [])
+            try expectEqual(item.title, "Teams meeting", "local label lost")
+            try expect(
+                !item.titleIsHumanSupplied,
+                "a source label claimed to be human-supplied — it would be sent")
+        }
+
+        h.test("a title a person supplied is sent") {
+            let item = QueueItem(
+                id: UUID(), audioFile: "a.m4a", masterFiles: [],
+                title: "Quarterly review with the board", titleIsHumanSupplied: true,
+                occurredAt: Date(), language: nil, sizeBytes: 1, state: .pending,
+                captureID: nil, transcriptID: nil, attempts: 0,
+                nextAttemptAt: .distantPast, lastError: nil, enqueuedAt: Date(),
+                completedAt: nil, unknownSpeakers: [], notifiedAt: nil,
+                namedSpeakers: [])
+            try expect(item.titleIsHumanSupplied, "a real title would be withheld")
+        }
+
+        h.test("a queue file written before the flag existed does not send its title") {
+            // Everything written then carried a source label, so absent
+            // must decode as not-human. Decoding it as `true` would
+            // resurrect "Teams meeting" on a retry of an old item.
+            let json = """
+                {"id":"\(UUID().uuidString)","audioFile":"a.m4a","masterFiles":[],
+                 "title":"Teams meeting","occurredAt":"2026-08-24T09:05:44Z",
+                 "sizeBytes":1,"state":"pending","attempts":0,
+                 "nextAttemptAt":"2026-08-24T09:05:44Z",
+                 "enqueuedAt":"2026-08-24T09:05:44Z","unknownSpeakers":[],
+                 "namedSpeakers":[]}
+                """
+            let decoder = JSONDecoder()
+            decoder.dateDecodingStrategy = .iso8601
+            let item = try decoder.decode(QueueItem.self, from: Data(json.utf8))
+            try expectEqual(item.title, "Teams meeting", "old item lost its label")
+            try expect(
+                !item.titleIsHumanSupplied,
+                "an old queue file would send its source label on retry")
+        }
+
         h.group("QueueFilter — finding one meeting among hundreds")
 
         func queued(
@@ -1955,6 +2009,45 @@ enum UnitTests {
                 arguments["content_type"] as? String, "audio/mp4", "content type")
             try expectEqual(arguments["size_bytes"] as? Int, 1234, "size")
             try expect(arguments["occurred_at"] != nil, "occurred_at was not sent")
+        }
+
+        h.asyncTest("no title means the key is absent, not empty") {
+            // Omitted, not blank. The server treats `title` as what the
+            // recording is about and weights it above the body in
+            // search; an empty string is still an answer, and it would
+            // suppress the title it derives from the transcript.
+            var arguments: [String: Any] = [:]
+            let mcp = client { request in
+                if request.url?.path == "/oauth/token" {
+                    return (200, #"{"access_token":"tok","expires_in":3600}"#)
+                }
+                let body =
+                    (try? JSONSerialization.jsonObject(with: request.httpBodyData ?? Data()))
+                    as? [String: Any]
+                arguments =
+                    (body?["params"] as? [String: Any])?["arguments"] as? [String: Any]
+                    ?? [:]
+                return (
+                    200,
+                    """
+                    {"jsonrpc":"2.0","id":1,"result":{"isError":false,
+                     "structuredContent":{"capture_id":992,
+                     "upload_url":"https://example.invalid/api/pa/uploads/audio/tkn",
+                     "upload_expires_in_seconds":1800,"status":"awaiting_upload"}}}
+                    """
+                )
+            }
+            _ = try await mcp.requestUpload(
+                filename: "20260824-090544-modulehost.m4a", sizeBytes: 1234,
+                title: nil, occurredAt: Date(timeIntervalSince1970: 0), language: nil)
+            try expect(
+                arguments["title"] == nil,
+                "a title key was sent when there is no title")
+            // Nothing is lost: the capturing process is still in the
+            // filename, which the server keeps.
+            try expectEqual(
+                arguments["filename"] as? String,
+                "20260824-090544-modulehost.m4a", "filename")
         }
 
         h.asyncTest("an in-band isError result is surfaced, not silently accepted") {

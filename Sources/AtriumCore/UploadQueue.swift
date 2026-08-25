@@ -26,7 +26,31 @@ public struct QueueItem: Codable, Equatable {
     /// each stream is recorded separately and a meeting interrupted by
     /// sleep has more than one segment. Retention sweeps them all.
     public var masterFiles: [String]
+    /// What this recording is called **locally**. Not necessarily sent.
+    ///
+    /// For a detected session this is a label for the source — "Teams
+    /// meeting", "WhatsApp call" — which is useful in this app's own
+    /// list and wrong to send upstream. See `titleIsHumanSupplied`.
     public var title: String?
+
+    /// Whether `title` came from a person rather than from whichever
+    /// process happened to hold the microphone.
+    ///
+    /// On the server, `title` means "what this recording is about". It
+    /// is the primary label in the captures list and carries a scoring
+    /// bonus over the body in keyword search. A source label therefore
+    /// makes every Teams recording identical in the list and matches
+    /// every search for "teams" or "meeting" — measured, 33 of the last
+    /// 43 uploads were affected.
+    ///
+    /// So a source label stays here and is never sent. Sending nothing
+    /// is better than sending something wrong: the server generates a
+    /// title from the transcript, which is a description of the content
+    /// rather than of the app that captured it. Nothing is lost either
+    /// way — the capturing process is already in the filename
+    /// (`20260824-090544-modulehost.m4a`), which the server keeps.
+    public var titleIsHumanSupplied: Bool = false
+
     public var occurredAt: Date
     public var language: String?
     public var sizeBytes: Int
@@ -89,6 +113,7 @@ public struct QueueItem: Codable, Equatable {
         audioFile: String,
         masterFiles: [String],
         title: String?,
+        titleIsHumanSupplied: Bool = false,
         occurredAt: Date,
         language: String?,
         sizeBytes: Int,
@@ -111,6 +136,7 @@ public struct QueueItem: Codable, Equatable {
         self.audioFile = audioFile
         self.masterFiles = masterFiles
         self.title = title
+        self.titleIsHumanSupplied = titleIsHumanSupplied
         self.occurredAt = occurredAt
         self.language = language
         self.sizeBytes = sizeBytes
@@ -164,6 +190,13 @@ public struct QueueItem: Codable, Equatable {
             ?? []
         notifiedAt = try c.decodeIfPresent(Date.self, forKey: .notifiedAt)
         namedSpeakers = try c.decodeIfPresent([String].self, forKey: .namedSpeakers) ?? []
+        // Absent means an item written before the distinction existed,
+        // and everything written then carried a source-derived title.
+        // Defaulting to false is therefore both the safe answer and the
+        // true one — it cannot resurrect a "Teams meeting" title on a
+        // retry of an old queue file.
+        titleIsHumanSupplied =
+            try c.decodeIfPresent(Bool.self, forKey: .titleIsHumanSupplied) ?? false
         directory = try c.decodeIfPresent(String.self, forKey: .directory)
         provisionalSpeakers =
             try c.decodeIfPresent(
@@ -807,13 +840,16 @@ public actor UploadQueue {
 
         Log.write(
             "upload: asking for a URL for \(item.audioFile) "
-                + "(\(Self.readableSize(item.sizeBytes)), “\(item.title ?? "untitled")”)"
+                + "(\(Self.readableSize(item.sizeBytes)), "
+                + (item.titleIsHumanSupplied
+                    ? "“\(item.title ?? "")”)" : "no title — the server will "
+                        + "derive one from the transcript)")
                 + (item.attempts > 0 ? " — attempt \(item.attempts + 1)" : ""))
 
         let ticket = try await client.requestUpload(
             filename: item.audioFile,
             sizeBytes: item.sizeBytes,
-            title: item.title,
+            title: item.titleIsHumanSupplied ? item.title : nil,
             occurredAt: item.occurredAt,
             language: item.language)
         Log.write(

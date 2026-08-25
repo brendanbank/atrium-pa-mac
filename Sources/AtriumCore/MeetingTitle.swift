@@ -1,17 +1,30 @@
 import Foundation
 
-/// What a recording is called, from the only evidence the Mac has.
+/// What a recording is called **on this Mac**. Never sent upstream.
 ///
 /// The app knows one thing Atrium PA cannot: which application was
-/// holding the microphone. Everything else worth putting in a title —
-/// the meeting's real name, who was invited — the server already
-/// derives, by correlating the recording's `occurred_at` against the
-/// calendar (`atrium_pa/correlator`), and it does that better than a
-/// window title ever would. So this says what is known and stops.
+/// holding the microphone. That is genuinely useful in this app's own
+/// recordings list, where "Teams meeting" next to a timestamp is how
+/// somebody finds the call they are looking for.
 ///
-/// Lives in `AtriumCore` rather than beside the menu so it can be
-/// tested; the wording ends up in `upload_audio(title:)` and in the
-/// user's transcript list, which is not somewhere to guess.
+/// ## It used to be sent, and that was wrong
+///
+/// On the server, `title` means *what this recording is about*: it is
+/// the primary label in the captures list and carries a scoring bonus
+/// over the body in keyword search. A label describing the **source**
+/// answers a different question, and answering the wrong question in
+/// that field is worse than leaving it empty — every Teams recording
+/// becomes identical in the list, and every search for "teams" or
+/// "meeting" matches all of them. Measured: 33 of the last 43 uploads.
+///
+/// So `upload_audio` is now sent no title at all unless a person
+/// supplied one, and the server derives one from the transcript —
+/// which describes the conversation rather than the app that captured
+/// it. Nothing is lost by omitting it: the capturing process is already
+/// in the filename (`20260824-090544-modulehost.m4a`), which the server
+/// keeps.
+///
+/// See `QueueItem.titleIsHumanSupplied`, which is what decides.
 public enum MeetingTitle {
 
     /// Chrome is deliberately "Browser call" and not "Google Meet".

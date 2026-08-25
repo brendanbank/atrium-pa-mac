@@ -3,6 +3,14 @@
     <channel>
         <title>Atrium PA Capture</title>
         <item>
+            <title>0.3.0</title>
+            <pubDate>Tue, 25 Aug 2026 22:11:54 +0200</pubDate>
+            <sparkle:version>300</sparkle:version>
+            <sparkle:shortVersionString>0.3.0</sparkle:shortVersionString>
+            <sparkle:minimumSystemVersion>14.2</sparkle:minimumSystemVersion>
+            <enclosure url="https://github.com/brendanbank/atrium-pa-mac/releases/download/v0.3.0/Atrium-PA-Capture-0.3.0.dmg" length="2739597" type="application/octet-stream" sparkle:edSignature="cA9cu2cB0xlZ0g272gK8aODia/AteFG71vt41nH1WMYmzDIbYDZjCKDMo1404RBs5Fcc1r1dnZaAToKKArhtDw==" />
+        </item>
+        <item>
             <title>0.2.1</title>
             <pubDate>Tue, 25 Aug 2026 14:47:24 +0200</pubDate>
             <sparkle:version>201</sparkle:version>

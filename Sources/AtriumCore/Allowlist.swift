@@ -47,11 +47,27 @@ public struct Allowlist: Codable, Equatable {
     /// you want phone calls recorded too.
     public static let defaults = Allowlist(prefixes: [
         "com.microsoft.teams2",   // Teams (+ .helper, .modulehost)
+        // The browsers, all of them. A meeting in a browser is a
+        // meeting, and which browser somebody uses is not a decision
+        // this app should be making for them — Chrome being here while
+        // Safari was not is an accident of which one got tested first.
+        //
+        // They are the ambiguous case by design: a browser holds the
+        // microphone identically for a call, a dictation box and a
+        // voice note. That is what
+        // `SessionPolicy.farEndConfirmationWindow` is for — record
+        // speculatively, discard within 60 s if no far end appears. The
+        // cost of a browser being here is a discarded file; the cost of
+        // it being absent is a meeting nobody recorded.
         "com.google.Chrome",      // Meet in Chrome (+ .helper)
+        "com.apple.Safari",       // Safari
+        "com.microsoft.edgemac",  // Edge
+        "company.thebrowser",     // Arc
         "us.zoom.xos",            // Zoom
         "net.whatsapp.WhatsApp",  // WhatsApp (+ .ServiceExtension)
         "com.apple.FaceTime",     // FaceTime, though see avconferenced
         "com.apple.avconferenced",  // ...which is what actually holds it
+        "com.tinyspeck.slackmacgap",  // Slack huddles (+ .helper)
     ])
 
     public func matches(bundleID: String?) -> Bool {

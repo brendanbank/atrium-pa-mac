@@ -47,6 +47,15 @@ public enum MeetingTitle {
         ("com.tinyspeck.slackmacgap", "Slack call"),
     ]
 
+    /// The apps this knows how to name.
+    ///
+    /// Exposed so a test can check that every one of them is also on
+    /// `Allowlist.defaults`. Giving an app a meeting title is a claim
+    /// that it is worth recording, and the two lists drifted apart once
+    /// already — Slack had a title here and no allowlist entry, so a
+    /// huddle recorded nothing and said nothing about why.
+    public static var knownPrefixes: [String] { byPrefix.map(\.prefix) }
+
     /// A recording the user started by hand is not a meeting and must
     /// not claim to be one — it is as likely to be a conversation in the
     /// room or a call on a phone on the desk.

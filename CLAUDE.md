@@ -192,6 +192,27 @@ Two consequences, both handled:
   said "ready to read" because at that moment there was genuinely
   nothing to ask for.
 
+**Dismissing a voice no longer exists.** Atrium PA removed it: it only
+ever reached two of six read surfaces, so a "dismissed" voice still
+appeared in both labeling queues and the web UI reported it as merged or
+deleted when it was neither. Three clusters on the whole deployment had
+ever been dismissed, all from testing the feature.
+
+`unnameSpeaker` alone is now the whole of "undo this naming", and one
+call is the better behaviour anyway — the reason to unname a voice is
+almost always that it is somebody *else*, not nobody, so having it come
+back and be asked about is the point.
+
+The replacements are **not** drop-ins. `reject_speaker` says *"this
+clustering is wrong"* — it nulls turn→cluster and keeps turn→person,
+making no claim about who was speaking — where `unname_speaker` says the
+opposite: the voice is fine, the name is wrong. Both `reject_speaker`
+and `wipe_person_voice_prints` are irreversible, refuse without
+`confirmed: true`, and reach **every recording the voice appears in**.
+`preview_voice_removal` is the read-only look before either, and its
+`recordings` count cannot be recomputed afterwards — nulling
+`voice_cluster_id` destroys the evidence of what was touched.
+
 **A guessed name is a question too.** A voice matched at `low` or
 `medium` confidence appears in `speakers[]`, not `unknown_speakers[]` —
 the server considers it answered — so reading only the unknown list shows

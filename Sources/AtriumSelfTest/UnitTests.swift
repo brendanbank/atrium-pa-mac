@@ -381,7 +381,16 @@ enum UnitTests {
 
         h.test("unrelated processes do not match") {
             let list = Allowlist.defaults
-            for bundleID in ["com.apple.corespeechd", "com.apple.Safari", ""] {
+            // Safari used to be the example here, on the reasoning that
+            // a browser is not a meeting app. It is one now — a meeting
+            // in a browser is a meeting, and which browser somebody uses
+            // should not decide whether it is recorded. So the example
+            // is something that genuinely holds the microphone for
+            // reasons that are never a call.
+            for bundleID in [
+                "com.apple.corespeechd", "com.apple.VoiceMemos",
+                "com.apple.QuickTimePlayerX", "",
+            ] {
                 try expect(
                     !list.matches(bundleID: bundleID), "\(bundleID) matched by mistake")
             }
@@ -905,6 +914,29 @@ enum UnitTests {
             controller.handle(event("com.google.Chrome.helper", capturing: true))
             try expect(waitUntil { session != nil }, "no session started")
             try expectEqual(session?.farEndConfirmed, false, "far-end pre-confirmed")
+        }
+
+        h.test("every app the app can name is also an app it will record") {
+            // Slack was missing from the allowlist while `MeetingTitle`
+            // had a "Slack call" entry for it and CLAUDE.md documented
+            // com.tinyspeck.slackmacgap.helper as a known mic holder.
+            // Two lists that have to agree, quietly disagreeing: a
+            // huddle recorded nothing and said nothing.
+            //
+            // Naming an app is a claim that it is worth recording, so
+            // the claim is checked rather than trusted.
+            for prefix in MeetingTitle.knownPrefixes {
+                try expect(
+                    Allowlist.defaults.matches(bundleID: prefix),
+                    "\(prefix) has a meeting title but is not on the allowlist, "
+                        + "so it would record nothing")
+            }
+        }
+
+        h.test("Slack huddles are recorded") {
+            try expect(
+                Allowlist.defaults.matches(bundleID: "com.tinyspeck.slackmacgap.helper"),
+                "the Slack helper is not matched — a huddle records nothing")
         }
 
         h.test("FaceTime is recognised by the daemon that holds the mic") {
@@ -1931,8 +1963,8 @@ enum UnitTests {
                 "person_id and create_person are mutually exclusive")
         }
 
-        h.asyncTest("unname and dismiss are addressed by voice, not by capture") {
-            // Both were sending capture_id, which the server rejects
+        h.asyncTest("unname is addressed by voice, not by capture") {
+            // It was sending capture_id, which the server rejects
             // outright: a name belongs to the *voice*, not to the
             // recording it was noticed in. Caught only by calling it for
             // real, so it is pinned here.
@@ -1961,16 +1993,6 @@ enum UnitTests {
                 sent["capture_id"] == nil,
                 "capture_id is rejected by the server: \(sent)")
 
-            try await mcp.dismissSpeaker(voiceCluster: 88)
-            try expectEqual(toolName, "dismiss_speaker", "tool")
-            try expectEqual(sent["voice_cluster_id"] as? Int, 88, "cluster")
-            try expect(sent["capture_id"] == nil, "capture_id is rejected")
-            // `dismissed` is required — the tool is a setter with an
-            // undo, not a verb.
-            try expectEqual(sent["dismissed"] as? Bool, true, "dismissed flag")
-
-            try await mcp.dismissSpeaker(voiceCluster: 88, dismissed: false)
-            try expectEqual(sent["dismissed"] as? Bool, false, "undismiss")
         }
 
         h.asyncTest("a missing scope reads as sign-in, not as a bare 403") {
@@ -2180,78 +2202,6 @@ enum UnitTests {
             try expect(!status.needsBytes, "needsBytes")
         }
 
-        h.asyncTest("skipped voices are reachable again, with their cluster ids") {
-            var sentArguments: [String: Any] = [:]
-            let mcp = client { request in
-                if request.url?.path == "/oauth/token" {
-                    return (200, #"{"access_token":"tok","expires_in":3600}"#)
-                }
-                if let body = request.httpBodyData,
-                    let json = try? JSONSerialization.jsonObject(with: body)
-                        as? [String: Any],
-                    let params = json["params"] as? [String: Any],
-                    let arguments = params["arguments"] as? [String: Any]
-                {
-                    sentArguments = arguments
-                }
-                return (
-                    200,
-                    """
-                    {"jsonrpc":"2.0","id":1,"result":{"isError":false,
-                     "structuredContent":{"unknown_speakers":[
-                       {"key":"S1","voice_cluster_id":1202,"turn_count":4,
-                        "dismissed":true},
-                       {"key":"S2","voice_cluster_id":1203,"turn_count":9}]}}}
-                    """
-                )
-            }
-
-            let skipped = try await mcp.dismissedSpeakers(transcriptID: 846)
-            // Only the dismissed one. The other entry is a live question
-            // and restoring it would be meaningless.
-            try expectEqual(skipped.count, 1, "dismissed voices")
-            try expectEqual(skipped.first?.voiceCluster, 1202, "cluster id")
-            try expect(skipped.first?.isDismissed == true, "dismissed flag")
-
-            // Without this flag the server filters dismissed voices out,
-            // which is what makes their cluster ids unreachable — and a
-            // restore needs the id.
-            try expectEqual(
-                sentArguments["include_dismissed"] as? Bool, true, "include_dismissed")
-            try expectEqual(
-                sentArguments["transcript_id"] as? Int, 846, "transcript id")
-        }
-
-        h.asyncTest("restoring a voice sets dismissed to false, addressed by cluster") {
-            var sentArguments: [String: Any] = [:]
-            var toolName = ""
-            let mcp = client { request in
-                if request.url?.path == "/oauth/token" {
-                    return (200, #"{"access_token":"tok","expires_in":3600}"#)
-                }
-                if let body = request.httpBodyData,
-                    let json = try? JSONSerialization.jsonObject(with: body)
-                        as? [String: Any],
-                    let params = json["params"] as? [String: Any]
-                {
-                    toolName = params["name"] as? String ?? ""
-                    sentArguments = params["arguments"] as? [String: Any] ?? [:]
-                }
-                return (
-                    200,
-                    #"{"jsonrpc":"2.0","id":1,"result":{"isError":false,"structuredContent":{"turn_count":4}}}"#
-                )
-            }
-
-            try await mcp.restoreSpeaker(voiceCluster: 1202)
-            try expectEqual(toolName, "dismiss_speaker", "tool")
-            try expectEqual(sentArguments["voice_cluster_id"] as? Int, 1202, "cluster")
-            // The flag is required and has no default server-side, so
-            // sending it wrong means dismissing what we meant to restore.
-            try expectEqual(sentArguments["dismissed"] as? Bool, false, "direction")
-            try expect(sentArguments["capture_id"] == nil, "a cluster is not a capture")
-        }
-
         h.asyncTest("delete_capture is a setter, and reports what it found") {
             var sentArguments: [String: Any] = [:]
             var toolName = ""
@@ -2287,7 +2237,7 @@ enum UnitTests {
             try expect(result.changed, "changed")
             try expect(!result.alreadyDeleted, "alreadyDeleted")
 
-            // Required and explicit, like `dismiss_speaker(dismissed:)`.
+            // Required and explicit rather than implied by the verb.
             // Sending it wrong deletes what was meant to be restored.
             try expectEqual(sentArguments["deleted"] as? Bool, true, "direction")
             try expectEqual(sentArguments["capture_id"] as? Int, 12353, "capture id")
@@ -2374,7 +2324,7 @@ enum UnitTests {
                     return (status, body)
                 }
                 do {
-                    _ = try await mcp.dismissedSpeakers(transcriptID: 1)
+                    _ = try await mcp.transcriptDetails(transcriptID: 1)
                     throw Harness.Failure(
                         message: "\(shape): a forbidden call succeeded",
                         file: #file, line: #line)

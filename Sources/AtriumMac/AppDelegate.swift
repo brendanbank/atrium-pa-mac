@@ -251,7 +251,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             let cluster = Int(CommandLine.arguments[index + 2])
         {
             DispatchQueue.main.asyncAfter(deadline: .now() + 1) { [weak self] in
-                self?.unnameAndDismiss(captureID: captureID, cluster: cluster)
+                self?.unname(captureID: captureID, cluster: cluster)
             }
         }
 
@@ -972,11 +972,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     /// Undo a naming: take the name off, then stop asking about it.
     ///
-    /// Two calls because the server will not overwrite a name in place —
-    /// correcting one is deliberately two decisions, since anchoring a
-    /// voice to the wrong person reaches backwards through every
-    /// recording it appears in.
-    private func unnameAndDismiss(captureID: Int, cluster: Int) {
+    /// Take the name back off a voice.
+    ///
+    /// This used to be two calls: `unname_speaker`, then
+    /// `dismiss_speaker` to stop it being offered again. Atrium PA
+    /// removed dismissal entirely — it only ever reached two of six read
+    /// surfaces, so a "dismissed" voice still appeared in the labeling
+    /// queues and the web UI reported it as merged or deleted when it
+    /// was neither. Three clusters on the whole deployment had ever been
+    /// dismissed, all from testing it.
+    ///
+    /// One call is also the better behaviour. The reason to unname a
+    /// voice is almost always that it is someone *else*, not nobody — so
+    /// having it come back and be asked about is the point, not a
+    /// consolation.
+    private func unname(captureID: Int, cluster: Int) {
         guard let client = makeClient() else {
             Log.write("unname: not signed in")
             return
@@ -985,8 +995,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             do {
                 try await client.unnameSpeaker(voiceCluster: cluster)
                 Log.write("unname: removed the name from cluster \(cluster)")
-                try await client.dismissSpeaker(voiceCluster: cluster)
-                Log.write("unname: dismissed cluster \(cluster)")
             } catch {
                 Log.write("unname: failed on cluster \(cluster) — \(error)")
             }
@@ -1026,7 +1034,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         // mistake, and said "no unnamed voices" as though that were the
         // only reason to look.
         guard item.openSpeakerQuestions > 0 || !item.knownSpeakers.isEmpty else {
-            offerToRestoreDismissed(in: item)
+            reportNothingToName(in: item)
             return
         }
         guard let client = makeClient() else {
@@ -1048,119 +1056,25 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         window.present(item: item, client: client, host: activityWindow)
     }
 
-    /// Nothing to name — so find out whether that is because everything
-    /// was skipped, and offer to undo it.
+    /// Nothing to name, and nothing hiding behind a flag any more.
     ///
-    /// Skipping a voice hides it from `unknown_speakers[]`, which is
-    /// what makes it stop being asked about — and also what puts its
-    /// cluster id out of reach, because restoring it needs that id.
-    /// `get_transcript(include_dismissed:)` is the way back in. Without
-    /// this, "Skip this voice" was a decision with no undo anywhere in
-    /// the app.
-    private func offerToRestoreDismissed(in item: QueueItem) {
-        func nothingToName(_ detail: String) {
-            ConnectionSheet.report(
-                title: "No voices to name", message: detail, success: true)
-            activityWindow?.reload()
-        }
-
-        guard let client = makeClient(), let transcriptID = item.transcriptID else {
-            nothingToName(
-                "Atrium PA is not offering any unnamed voices in this recording.")
-            return
-        }
-
-        Task { [weak self] in
-            let skipped: [MCPClient.UnknownSpeaker]
-            do {
-                skipped = try await client.dismissedSpeakers(transcriptID: transcriptID)
-            } catch {
-                Log.write("naming: could not list skipped voices — \(error)")
-                await MainActor.run {
-                    if case MCPClient.ClientError.loginRequired(let why) = error {
-                        // A token cannot grow a scope it was not issued
-                        // with. Reading the skipped list needs pa.read,
-                        // which a sign-in from before this feature does
-                        // not carry.
-                        ConnectionSheet.report(
-                            title: "Log in to Atrium PA again",
-                            message: "Listing skipped voices needs a permission your "
-                                + "current sign-in does not have. Choose “Log in to "
-                                + "Atrium PA again…” and this will work.\n\n\(why)",
-                            success: false)
-                    } else {
-                        nothingToName(
-                            "Atrium PA is not offering any unnamed voices in this "
-                                + "recording, and the list of skipped ones could not "
-                                + "be read — \(error)")
-                    }
-                }
-                return
-            }
-
-            let restorable = skipped.filter(\.isNameable)
-            Log.write(
-                "naming: \(skipped.count) skipped voice(s) in transcript "
-                    + "\(transcriptID), \(restorable.count) restorable")
-
-            await MainActor.run {
-                guard !restorable.isEmpty else {
-                    nothingToName(
-                        "Atrium PA is not offering any unnamed voices in this "
-                            + "recording, and none were skipped. A recording where "
-                            + "diarization attributed nothing has none to offer.")
-                    return
-                }
-                self?.confirmRestore(restorable, in: item, using: client)
-            }
-        }
+    /// This used to list voices that had been *skipped* and offer to ask
+    /// about them again — skipping hid a voice from
+    /// `unknown_speakers[]`, so without a way back it was a decision
+    /// with no undo. Atrium PA removed dismissal, so there is no such
+    /// list: a recording with nothing to name genuinely has nothing.
+    private func reportNothingToName(in item: QueueItem) {
+        ConnectionSheet.report(
+            title: "No voices to name",
+            message: item.transcriptID == nil
+                ? "This recording has no transcript yet."
+                : "Atrium PA is not offering any voices for this recording. A "
+                    + "recording where diarization attributed nothing has none "
+                    + "to offer.",
+            success: true)
+        activityWindow?.reload()
     }
 
-    private func confirmRestore(
-        _ voices: [MCPClient.UnknownSpeaker], in item: QueueItem, using client: MCPClient
-    ) {
-        NSApp.activate(ignoringOtherApps: true)
-        let alert = NSAlert()
-        alert.messageText =
-            voices.count == 1
-            ? "One voice in this recording was skipped"
-            : "\(voices.count) voices in this recording were skipped"
-        let turns = voices.reduce(0) { $0 + $1.turnCount }
-        alert.informativeText =
-            "Nothing was deleted when they were skipped — the turns, the sample "
-            + "audio and the voice print are all still there, and \(turns) turn(s) "
-            + "are waiting. Ask about them again?"
-        alert.addButton(withTitle: "Ask Again")
-        alert.addButton(withTitle: "Leave Them Skipped")
-        guard alert.runModal() == .alertFirstButtonReturn else { return }
-
-        Task { [weak self] in
-            for voice in voices {
-                guard let cluster = voice.voiceCluster else { continue }
-                do {
-                    try await client.restoreSpeaker(voiceCluster: cluster)
-                    Log.write("naming: restored cluster \(cluster)")
-                } catch {
-                    Log.write("naming: could not restore cluster \(cluster) — \(error)")
-                }
-            }
-            let refreshed = await self?.uploadQueue.refreshSpeakers(itemID: item.id)
-            await MainActor.run {
-                self?.activityWindow?.reload()
-                if let refreshed, refreshed.openSpeakerQuestions > 0 {
-                    self?.presentNaming(resolved: refreshed)
-                }
-            }
-        }
-    }
-
-    /// Open a recording in Atrium PA's web UI.
-    ///
-    /// The address is `/pa/captures/<capture id>`. It used to be
-    /// `/pa/transcripts/<transcript id>`, which is a route the front end
-    /// does not have — checked against `frontend/src/main.tsx`, where
-    /// `/pa/captures/:id` is registered and no transcripts route is. So
-    /// the button opened a page that could not exist.
     private func openInAtriumPA(captureID: Int) {
         guard let base = URL(string: config.baseURL) else { return }
         let target = base.appending(path: "pa/captures/\(captureID)")

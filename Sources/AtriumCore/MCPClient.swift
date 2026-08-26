@@ -41,7 +41,7 @@ public actor MCPClient {
     /// A voice in a finished recording that nobody has identified.
     ///
     /// `voiceCluster` is optional and its absence is load-bearing: an
-    /// entry without one cannot be identified, named or dismissed
+    /// entry without one cannot be identified or named
     /// through the API at all, and the only thing to do with it is send
     /// the user to the web UI.
     public struct UnknownSpeaker: Codable, Equatable {
@@ -49,33 +49,25 @@ public actor MCPClient {
         public let voiceCluster: Int?
         public let turnCount: Int
         public let nameSpeakerURL: String?
-        /// True only in the list `get_transcript(include_dismissed:)`
-        /// returns. Everywhere else dismissed voices are filtered out
-        /// before we see them, which is the whole point of dismissing
-        /// one.
-        public let isDismissed: Bool
-
         public init(
-            key: String, voiceCluster: Int?, turnCount: Int, nameSpeakerURL: String?,
-            isDismissed: Bool = false
+            key: String, voiceCluster: Int?, turnCount: Int, nameSpeakerURL: String?
         ) {
             self.key = key
             self.voiceCluster = voiceCluster
             self.turnCount = turnCount
             self.nameSpeakerURL = nameSpeakerURL
-            self.isDismissed = isDismissed
         }
 
-        /// Decoded leniently: `isDismissed` did not exist in the first
-        /// version, and a queue file is read by builds newer than the
-        /// one that wrote it. See `QueueItem.init(from:)`.
+        /// Decoded leniently, because a queue file is read by builds
+        /// newer than the one that wrote it — this shape has already
+        /// lost a field (`dismissed`, which Atrium PA removed), and an
+        /// item written before that decodes by ignoring it.
         public init(from decoder: Decoder) throws {
             let c = try decoder.container(keyedBy: CodingKeys.self)
             key = try c.decode(String.self, forKey: .key)
             voiceCluster = try c.decodeIfPresent(Int.self, forKey: .voiceCluster)
             turnCount = try c.decodeIfPresent(Int.self, forKey: .turnCount) ?? 0
             nameSpeakerURL = try c.decodeIfPresent(String.self, forKey: .nameSpeakerURL)
-            isDismissed = try c.decodeIfPresent(Bool.self, forKey: .isDismissed) ?? false
         }
 
         public var isNameable: Bool { voiceCluster != nil }
@@ -614,19 +606,6 @@ public actor MCPClient {
             tool: "unname_speaker", arguments: ["voice_cluster_id": voiceCluster])
     }
 
-    /// Stop being asked about a voice, without naming it — or start
-    /// again, with `dismissed: false`.
-    ///
-    /// `dismissed` is required rather than implied, because the tool is
-    /// a setter and not a verb: there is an undo, and a call that could
-    /// only ever mean "yes" would have needed a second tool to undo it.
-    /// Addressed by cluster alone, like `unnameSpeaker`.
-    public func dismissSpeaker(voiceCluster: Int, dismissed: Bool = true) async throws {
-        _ = try await call(
-            tool: "dismiss_speaker",
-            arguments: ["voice_cluster_id": voiceCluster, "dismissed": dismissed])
-    }
-
     /// A voice Atrium PA has already put a name to, but only as a
     /// guess.
     ///
@@ -889,36 +868,6 @@ public actor MCPClient {
         pool.removeAll()
     }
 
-    /// Voices in this transcript that were dismissed.
-    ///
-    /// Dismissing a voice hides it from `unknown_speakers[]` everywhere
-    /// else, which is what makes it stop being asked about — and also
-    /// what makes it unreachable, because `dismiss_speaker(dismissed:
-    /// false)` needs the cluster id that has just been hidden.
-    /// `get_transcript(include_dismissed: true)` is the way back in;
-    /// atrium-pa calls the alternative "a one-way door".
-    ///
-    /// Needs `pa.read`, which is why the login scope includes it.
-    public func dismissedSpeakers(transcriptID: Int) async throws -> [UnknownSpeaker] {
-        let payload = try await call(
-            tool: "get_transcript",
-            arguments: [
-                "transcript_id": transcriptID,
-                "include_dismissed": true,
-                // The summary is the expensive part of this response and
-                // nothing here reads it.
-                "summary_max_chars": 0,
-            ])
-        return Self.unknownSpeakers(from: payload).filter(\.isDismissed)
-    }
-
-    /// Start being asked about a voice again. Nothing was deleted when
-    /// it was dismissed — the turns, the samples and the voice print are
-    /// untouched — so this restores the question, not the data.
-    public func restoreSpeaker(voiceCluster: Int) async throws {
-        try await dismissSpeaker(voiceCluster: voiceCluster, dismissed: false)
-    }
-
     /// What `delete_capture` reports back.
     public struct DeletionResult: Equatable {
         public let captureID: Int
@@ -944,7 +893,7 @@ public actor MCPClient {
     /// "gone" is the mistake this comment exists to prevent.
     ///
     /// `deleted` is required and has no default, like
-    /// `dismissSpeaker`: the tool is a setter, and a call that could
+    /// The tool is a setter rather than a verb: a call that could
     /// only ever mean "yes" would have needed a second tool to undo it.
     /// Undo matters more here than usual — see `atrium-mac`'s delete
     /// dialog for why re-uploading the same file is not a way back.
@@ -1084,7 +1033,7 @@ public actor MCPClient {
                 voiceCluster: entry["voice_cluster_id"] as? Int,
                 turnCount: entry["turn_count"] as? Int ?? 0,
                 nameSpeakerURL: entry["name_speaker_url"] as? String,
-                isDismissed: entry["dismissed"] as? Bool ?? false)
+            )
         }
     }
 

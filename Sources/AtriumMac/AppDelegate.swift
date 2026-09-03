@@ -202,6 +202,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         // missed, which is the one launch where saying so matters.
         reportPermissionsWhenSettled()
 
+        // Offer any trigger apps added to the defaults since this file
+        // was written. A beat after launch, so it does not stack on the
+        // permission dialogs.
+        DispatchQueue.main.asyncAfter(deadline: .now() + 2) { [weak self] in
+            self?.offerNewAllowlistDefaults()
+        }
+
         // Show the main window on launch. This is a `.regular` app, and
         // an app that comes to the front showing nothing reads exactly
         // like a launch that failed.
@@ -875,6 +882,91 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     @objc private func editAllowlist() {
         Allowlist.seedIfMissing()
         NSWorkspace.shared.open(Allowlist.configURL)
+    }
+
+    /// Offer trigger apps added to the shipped defaults since the
+    /// user's allowlist was written — see `Allowlist.unofferedDefaults`.
+    ///
+    /// The alternative, merging them in silently, would re-add a prefix
+    /// the user deliberately removed. This app asks rather than decides,
+    /// and the offered-set is what lets "Not now" be a real answer
+    /// instead of a question repeated every launch.
+    private func offerNewAllowlistDefaults() {
+        let offered = Allowlist.loadOffered()
+        let additions = Allowlist.unofferedDefaults(
+            current: allowlist.prefixes, offered: offered)
+        guard !additions.isEmpty else { return }
+
+        // Recorded as offered whatever the answer is, so declining
+        // settles it. Written before the dialog returns would be wrong —
+        // a crash mid-prompt should leave it still to ask — but after
+        // the answer, both paths mark it seen.
+        func remember() {
+            Allowlist.saveOffered(offered.union(additions))
+        }
+
+        let names = additions
+            .map { Self.allowlistDisplayName(for: $0) }
+            .reduce(into: [String]()) { list, name in
+                if !list.contains(name) { list.append(name) }
+            }
+        let joined = Self.sentenceList(names)
+
+        NSApp.activate(ignoringOtherApps: true)
+        let alert = NSAlert()
+        alert.messageText = "Record \(joined)?"
+        alert.informativeText =
+            "This version of Atrium PA Capture can record \(joined), which your "
+            + "allowlist does not cover yet. Add them?\n\nYou can always change "
+            + "the allowlist later from the menu."
+        alert.addButton(withTitle: "Add")
+        alert.addButton(withTitle: "Not Now")
+
+        if alert.runModal() == .alertFirstButtonReturn {
+            var updated = allowlist
+            updated.prefixes.append(contentsOf: additions)
+            do {
+                try updated.save()
+                allowlist = updated
+                Log.write(
+                    "allowlist: added \(additions.joined(separator: ", ")) on the "
+                        + "user's yes")
+                refreshMenu()
+            } catch {
+                Log.write("allowlist: could not add \(additions) — \(error)")
+            }
+        } else {
+            Log.write("allowlist: user declined \(additions.joined(separator: ", "))")
+        }
+        remember()
+    }
+
+    /// A human name for a bundle-ID prefix, for the offer dialog. Falls
+    /// back to the prefix itself rather than inventing one.
+    private static func allowlistDisplayName(for prefix: String) -> String {
+        switch prefix {
+        case "com.tinyspeck.slackmacgap": return "Slack"
+        case "com.apple.Safari": return "Safari"
+        case "com.microsoft.edgemac": return "Edge"
+        case "company.thebrowser": return "Arc"
+        case "com.google.Chrome": return "Chrome"
+        case "com.microsoft.teams2": return "Teams"
+        case "us.zoom.xos": return "Zoom"
+        case "net.whatsapp.WhatsApp": return "WhatsApp"
+        case "com.apple.FaceTime", "com.apple.avconferenced": return "FaceTime"
+        default: return prefix
+        }
+    }
+
+    /// "Slack", "Slack and Safari", "Slack, Safari and Edge".
+    private static func sentenceList(_ items: [String]) -> String {
+        switch items.count {
+        case 0: return ""
+        case 1: return items[0]
+        case 2: return "\(items[0]) and \(items[1])"
+        default:
+            return items.dropLast().joined(separator: ", ") + " and " + items.last!
+        }
     }
 
     @objc private func reloadAllowlist() {

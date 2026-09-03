@@ -70,6 +70,34 @@ public struct Allowlist: Codable, Equatable {
         "com.tinyspeck.slackmacgap",  // Slack huddles (+ .helper)
     ])
 
+    /// Default prefixes the user's list lacks and has never been shown.
+    ///
+    /// This is the whole reason a shipped trigger app can reach an
+    /// existing install. `seedIfMissing` only writes when there is no
+    /// file, so once someone has one, a new default is invisible until
+    /// they hand-edit the JSON — a Slack huddle that records nothing and
+    /// says nothing about why.
+    ///
+    /// `offered` is what keeps this honest. Without it there are only
+    /// two bad options: prompt about the same prefix on every launch, or
+    /// re-add one the user *deliberately deleted*. A prefix that has been
+    /// offered — accepted or declined — is never offered again, so
+    /// declining is a real answer and removing is respected.
+    ///
+    /// A default already covered by a broader entry is not offered
+    /// either: someone who listed `com.apple` does not need asking about
+    /// `com.apple.Safari`.
+    public static func unofferedDefaults(
+        current: [String], offered: Set<String>
+    ) -> [String] {
+        defaults.prefixes.filter { candidate in
+            guard !offered.contains(candidate) else { return false }
+            return !current.contains { existing in
+                !existing.isEmpty && candidate.hasPrefix(existing)
+            }
+        }
+    }
+
     public func matches(bundleID: String?) -> Bool {
         guard let bundleID else { return false }
         return prefixes.contains { !$0.isEmpty && bundleID.hasPrefix($0) }
@@ -103,6 +131,34 @@ public struct Allowlist: Codable, Equatable {
         let encoder = JSONEncoder()
         encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
         try encoder.encode(self).write(to: url, options: .atomic)
+    }
+
+    /// Where the "already offered" set lives.
+    ///
+    /// A sibling of `allowlist.json`, not a field inside it: that file is
+    /// the one a person edits by hand, and bookkeeping does not belong in
+    /// it. Leading dot so it does not invite editing.
+    public static var offeredURL: URL {
+        configURL.deletingLastPathComponent()
+            .appending(path: ".allowlist-offered.json")
+    }
+
+    /// The default prefixes the user has already been asked about.
+    public static func loadOffered() -> Set<String> {
+        guard
+            let data = try? Data(contentsOf: offeredURL),
+            let decoded = try? JSONDecoder().decode([String].self, from: data)
+        else { return [] }
+        return Set(decoded)
+    }
+
+    public static func saveOffered(_ offered: Set<String>) {
+        let url = offeredURL
+        try? FileManager.default.createDirectory(
+            at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
+        try? encoder.encode(offered.sorted()).write(to: url, options: .atomic)
     }
 
     /// Write defaults to disk if no config exists yet, so there is

@@ -933,6 +933,63 @@ enum UnitTests {
             }
         }
 
+        h.group("Allowlist — new defaults reach an existing file")
+
+        h.test("a new default the file lacks is offered once") {
+            // The file predates Slack. It has never been offered, so it
+            // is offered — and this is the whole point: a shipped
+            // trigger app reaching an install that already has a config.
+            let current = ["com.microsoft.teams2", "us.zoom.xos"]
+            let offer = Allowlist.unofferedDefaults(current: current, offered: [])
+            try expect(
+                offer.contains("com.tinyspeck.slackmacgap"),
+                "Slack was not offered to a file that lacks it")
+        }
+
+        h.test("a default already in the file is not offered") {
+            let offer = Allowlist.unofferedDefaults(
+                current: Allowlist.defaults.prefixes, offered: [])
+            try expect(offer.isEmpty, "a complete file was still offered something")
+        }
+
+        h.test("a deliberately removed default is not re-offered") {
+            // Removing a prefix and having it come back is the failure
+            // that ruled out merge-on-launch. Once offered, it stays
+            // answered: a user who took Safari out is not asked again.
+            let current = ["com.microsoft.teams2"]
+            let offered: Set = ["com.apple.Safari"]
+            let offer = Allowlist.unofferedDefaults(current: current, offered: offered)
+            try expect(
+                !offer.contains("com.apple.Safari"),
+                "a removed-and-declined default was offered again")
+        }
+
+        h.test("a default covered by a broader entry is not offered") {
+            // Someone who listed the whole of com.apple should not be
+            // asked about com.apple.Safari.
+            let offer = Allowlist.unofferedDefaults(
+                current: ["com.apple"], offered: [])
+            try expect(
+                !offer.contains("com.apple.Safari"),
+                "Safari was offered despite a broader com.apple entry")
+            try expect(
+                !offer.contains("com.apple.FaceTime"),
+                "FaceTime was offered despite a broader com.apple entry")
+        }
+
+        h.test("declining leaves nothing to offer next time") {
+            // The launch flow's contract, in miniature: offer, record
+            // what was offered, and the next pass is empty.
+            let current = ["com.microsoft.teams2"]
+            let first = Allowlist.unofferedDefaults(current: current, offered: [])
+            try expect(!first.isEmpty, "nothing to offer on a sparse file")
+            let afterDecline = Allowlist.unofferedDefaults(
+                current: current, offered: Set(first))
+            try expect(
+                afterDecline.isEmpty,
+                "a second pass re-offered what was already declined")
+        }
+
         h.test("Slack huddles are recorded") {
             try expect(
                 Allowlist.defaults.matches(bundleID: "com.tinyspeck.slackmacgap.helper"),

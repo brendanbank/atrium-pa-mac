@@ -172,6 +172,13 @@ final class MicCapture {
     /// Pre-allocated mono scratch for the realtime callback.
     private var scratch: UnsafeMutablePointer<Float>?
     private var scratchCapacity = 0
+    /// Per-channel sum of squares, for the multi-channel diagnostic.
+    /// POD, written only from the render thread — see `logChannelBalance`.
+    /// Allocated once per binding when there is more than one channel,
+    /// nil otherwise so the common 1-channel path pays nothing.
+    private var channelAccum: UnsafeMutablePointer<Double>?
+    private var channelAccumFrames = 0
+    private var channelCount = 0
 
     /// 30 s at 48 kHz mono is ~5.7 MB. Matches `ProcessTap`.
     private let ringSeconds: Double = 30
@@ -266,6 +273,24 @@ final class MicCapture {
         self.scratch = scratch
         self.scratchCapacity = scratchFrames
 
+        // Per-channel level for a multi-channel input. WhatsApp turns the
+        // built-in mic into a voice-processed 3-channel device, and
+        // averaging those channels is what dropped the near-end to
+        // near-silence (#12). This reveals which channel actually carried
+        // the voice — measured before deciding which one to keep, rather
+        // than guessing. Logs the previous binding first, so a device
+        // switch mid-session still reports the segment before it.
+        logChannelBalance(reason: isFollowingDevice ? "before device switch" : "start")
+        if channels > 1 {
+            let accum = UnsafeMutablePointer<Double>.allocate(capacity: channels)
+            accum.initialize(repeating: 0, count: channels)
+            channelAccum = accum
+        } else {
+            channelAccum = nil
+        }
+        channelAccumFrames = 0
+        channelCount = channels
+
         var proc: AudioDeviceIOProcID?
         let status = AudioDeviceCreateIOProcIDWithBlock(
             &proc, device, DispatchQueue(label: "com.atrium-mac.mic-render")
@@ -303,6 +328,17 @@ final class MicCapture {
                     let magnitude = abs(value)
                     if magnitude > localPeak { localPeak = magnitude }
                 }
+                // Only when more than one channel — nil for a normal mic,
+                // so this whole pass is skipped in the common case.
+                if let channelAccum {
+                    for frame in 0..<frames {
+                        for channel in 0..<channels {
+                            let s = Double(samples[frame * channels + channel])
+                            channelAccum[channel] += s * s
+                        }
+                    }
+                    self.channelAccumFrames += frames
+                }
             } else {
                 // One buffer per channel, each already mono.
                 frames = min(
@@ -320,6 +356,18 @@ final class MicCapture {
                 for frame in 0..<frames {
                     let magnitude = abs(scratch[frame])
                     if magnitude > localPeak { localPeak = magnitude }
+                }
+                if let channelAccum {
+                    for (channel, buffer) in buffers.enumerated()
+                    where channel < self.channelCount {
+                        guard let cd = buffer.mData else { continue }
+                        let s = cd.bindMemory(to: Float.self, capacity: frames)
+                        for frame in 0..<frames {
+                            let v = Double(s[frame])
+                            channelAccum[channel] += v * v
+                        }
+                    }
+                    self.channelAccumFrames += frames
                 }
             }
 
@@ -513,6 +561,7 @@ final class MicCapture {
         }
         procID = nil
         isRunning = false
+        logChannelBalance(reason: "session end")
         cleanup()
     }
 
@@ -526,7 +575,43 @@ final class MicCapture {
             self.scratch = nil
             scratchCapacity = 0
         }
+        if let channelAccum {
+            channelAccum.deallocate()
+            self.channelAccum = nil
+            channelAccumFrames = 0
+        }
         deviceID = 0
+    }
+
+    /// Emit the per-channel RMS of the binding that just ended.
+    ///
+    /// Runs off the render thread — building a string and writing the log
+    /// are fine here, they are not fine in the IOProc. A no-op for a
+    /// one-channel device, which is the whole point: it says nothing
+    /// until a multi-channel voice-processed input appears.
+    ///
+    /// This is a diagnostic, not the fix. It answers the one question the
+    /// existing logs cannot — which channel of a 3-channel WhatsApp
+    /// stream carries the near-end voice — so the fix can keep that
+    /// channel rather than averaging all three into near-silence.
+    private func logChannelBalance(reason: String) {
+        guard let accum = channelAccum else { return }
+        defer {
+            accum.deallocate()
+            channelAccum = nil
+            channelAccumFrames = 0
+        }
+        guard channelAccumFrames > 0, channelCount > 1 else { return }
+        var parts: [String] = []
+        for channel in 0..<channelCount {
+            let rms = (accum[channel] / Double(channelAccumFrames)).squareRoot()
+            parts.append(String(format: "ch%d %.5f", channel, rms))
+        }
+        Log.write(
+            "mic: \(channelCount)-channel input (\(reason)) — per-channel RMS "
+                + parts.joined(separator: ", ")
+                + ". Averaging these is what a voice-processed stream loses to; "
+                + "the loud channel is the near-end voice.")
     }
 
     // MARK: - Consumer side

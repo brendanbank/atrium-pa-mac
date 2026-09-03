@@ -362,6 +362,10 @@ final class AudioRecorder {
             guard let self, self.isRecording else { return }
             self.tap.restartIfStalled()
             self.mic.restartIfStalled()
+            // Cheap, and only logs on change — catches a clean input
+            // device appearing mid-call, which is how a WhatsApp capture
+            // escapes the contended voice-processed built-in. See #12.
+            self.mic.logInputDevicesIfChanged("mid-recording")
         }
         timer.setEventHandler { [weak self] in self?.drain() }
         timer.resume()

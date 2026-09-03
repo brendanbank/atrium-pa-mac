@@ -179,6 +179,8 @@ final class MicCapture {
     private var channelAccum: UnsafeMutablePointer<Double>?
     private var channelAccumFrames = 0
     private var channelCount = 0
+    /// Last-logged input-device list, so only changes are logged.
+    private var lastInputDeviceSummary = ""
 
     /// 30 s at 48 kHz mono is ~5.7 MB. Matches `ProcessTap`.
     private let ringSeconds: Double = 30
@@ -290,6 +292,8 @@ final class MicCapture {
         }
         channelAccumFrames = 0
         channelCount = channels
+        if !isFollowingDevice { lastInputDeviceSummary = "" }
+        logInputDevicesIfChanged("bound to device \(device)")
 
         var proc: AudioDeviceIOProcID?
         let status = AudioDeviceCreateIOProcIDWithBlock(
@@ -594,6 +598,19 @@ final class MicCapture {
     /// existing logs cannot — which channel of a 3-channel WhatsApp
     /// stream carries the near-end voice — so the fix can keep that
     /// channel rather than averaging all three into near-silence.
+    /// Log the input-device list, but only when it changes.
+    ///
+    /// The signal for #12: on the WhatsApp calls that recorded fine, a
+    /// separate clean input device appeared ~20 s in and the capture
+    /// followed it. This makes that appearance visible — and, on a stuck
+    /// call, shows whether such a device exists at all.
+    func logInputDevicesIfChanged(_ reason: String) {
+        let summary = CA.inputDeviceSummary()
+        guard summary != lastInputDeviceSummary else { return }
+        lastInputDeviceSummary = summary
+        Log.write("mic: input devices (\(reason)) — \(summary)")
+    }
+
     private func logChannelBalance(reason: String) {
         guard let accum = channelAccum else { return }
         defer {

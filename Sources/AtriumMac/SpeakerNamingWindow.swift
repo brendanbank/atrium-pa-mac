@@ -1,4 +1,3 @@
-import AVFoundation
 import AppKit
 import AtriumCore
 import Foundation
@@ -26,7 +25,7 @@ import Foundation
 /// percentage appears next to its band because 44% and 91% must not read
 /// the same, and an invitee who declined is not offered at all: the
 /// server returns the RSVP, and somebody who said no was not there.
-final class SpeakerNamingWindow: NSWindow, AVAudioPlayerDelegate {
+final class SpeakerNamingWindow: NSWindow {
 
     /// Called with the speaker key once a voice has been named, so the
     /// badge can come down and stay down. The name is carried too
@@ -38,7 +37,7 @@ final class SpeakerNamingWindow: NSWindow, AVAudioPlayerDelegate {
     private var rows: [VoiceRow] = []
     private let newPersonSheet = NewPersonSheet()
     private var evidenceByKey: [String: MCPClient.SpeakerEvidence] = [:]
-    private var player: AVAudioPlayer?
+    private let player = ClipPlayer()
     /// Which row is sounding, so its button can be put back.
     private var playingRow: VoiceRow?
     /// Bumped on every play or stop, so a clip that finishes
@@ -58,6 +57,10 @@ final class SpeakerNamingWindow: NSWindow, AVAudioPlayerDelegate {
             backing: .buffered, defer: false)
         title = "Who was in this recording?"
         isReleasedWhenClosed = false
+        // A clip that ran to its end leaves a stop button that would do
+        // nothing, which is the same wrong state as one that never
+        // started.
+        player.onFinish = { [weak self] in self?.stopPlayback() }
         minSize = NSSize(width: 560, height: 260)
         buildContent()
     }
@@ -257,13 +260,28 @@ final class SpeakerNamingWindow: NSWindow, AVAudioPlayerDelegate {
                 let data = try await client.fetchSample(sample)
                 onMainThread {
                     guard let self, generation == self.playGeneration else { return }
-                    self.player = try? AVAudioPlayer(data: data)
-                    self.player?.delegate = self
-                    self.player?.play()
+                    do {
+                        try self.player.play(data)
+                    } catch {
+                        // Said out loud in both places. A clip that
+                        // arrives and then does not sound is the
+                        // failure this whole path was blind to for as
+                        // long as it used `AVAudioPlayer`, which
+                        // declines Ogg Vorbis without erroring.
+                        Log.write(
+                            "naming: clip \(sample.sampleID) arrived "
+                                + "(\(data.count) bytes) and would not play — "
+                                + "\(error)")
+                        self.stopPlayback()
+                        row.failed("that clip would not play")
+                    }
                 }
             } catch {
                 onMainThread {
                     guard let self, generation == self.playGeneration else { return }
+                    Log.write(
+                        "naming: clip \(sample.sampleID) could not be fetched — "
+                            + "\(error)")
                     self.stopPlayback()
                     row.failed("that clip is no longer available")
                 }
@@ -274,17 +292,9 @@ final class SpeakerNamingWindow: NSWindow, AVAudioPlayerDelegate {
     /// Silence whatever is sounding and put its button back.
     private func stopPlayback() {
         playGeneration += 1
-        player?.stop()
-        player = nil
+        player.stop()
         playingRow?.setPlaying(false)
         playingRow = nil
-    }
-
-    func audioPlayerDidFinishPlaying(_ player: AVAudioPlayer, successfully: Bool) {
-        // A clip that ran to its end leaves a stop button that would do
-        // nothing, which is the same wrong state as one that never
-        // started.
-        DispatchQueue.main.async { [weak self] in self?.stopPlayback() }
     }
 
     // MARK: - Naming

@@ -130,6 +130,20 @@ public struct RecordingSidecar: Codable, Equatable {
             .sorted { $0.1.startedAt < $1.1.startedAt }
     }
 
+    /// The unfinished sidecar a live session was filed under.
+    ///
+    /// **Not `==` on `startedAt`.** The sidecar is ISO-8601 on disk, which
+    /// keeps whole seconds, and the session's `startedAt` is a `Date()`
+    /// with milliseconds — so the two are never equal. Matching that way
+    /// made every resume after sleep return without a word, leaving the
+    /// meeting on disk until the next launch happened to pick it up.
+    public static func orphan(for session: Session) -> (stem: String, sidecar: RecordingSidecar)? {
+        orphans().first {
+            $0.sidecar.bundleID == session.bundleID
+                && abs($0.sidecar.startedAt.timeIntervalSince(session.startedAt)) < 1
+        }
+    }
+
     /// Delete every file this session produced. Used when a session is
     /// discarded — a mic test that was never a call.
     public func discardFiles(stem: String) {

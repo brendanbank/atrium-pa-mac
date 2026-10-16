@@ -2887,6 +2887,35 @@ enum UnitTests {
             }
         }
 
+        h.test("a live session finds its sidecar despite sub-second start times") {
+            try withTemporaryRoot {
+                // A real session starts at Date(), milliseconds and all;
+                // ISO-8601 on disk keeps whole seconds. Matching with ==
+                // never resumed a meeting after sleep.
+                let session = Session(
+                    bundleID: "com.microsoft.teams2",
+                    startedAt: Date(timeIntervalSince1970: 1_700_000_000.375))
+                RecordingSidecar(session: session).write(stem: "live")
+                RecordingSidecar(
+                    bundleID: "us.zoom.xos", startedAt: session.startedAt,
+                    isManual: false
+                ).write(stem: "other")
+
+                let found = RecordingSidecar.orphan(for: session)
+                try expectEqual(found?.stem, "live", "stem")
+                try expect(
+                    found?.sidecar.startedAt != session.startedAt,
+                    "the round trip no longer truncates — this test proves nothing")
+
+                let later = Session(
+                    bundleID: session.bundleID,
+                    startedAt: session.startedAt.addingTimeInterval(5))
+                try expect(
+                    RecordingSidecar.orphan(for: later) == nil,
+                    "a different session must not claim this recording")
+            }
+        }
+
         h.test("a three-hour meeting stays inside the server's per-file limit") {
             // Arithmetic, not a three-hour test: 32 kbps mono AAC.
             let bytes = AudioEncoder.uploadBitRate / 8 * 3 * 3600

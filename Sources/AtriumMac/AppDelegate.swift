@@ -391,9 +391,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     @objc private func systemDidWake() {
         guard let session = interruptedSession else { return }
         interruptedSession = nil
-        guard let (stem, sidecar) = RecordingSidecar.orphans().first(where: {
-            $0.sidecar.startedAt == session.startedAt
-        }) else { return }
+        guard let (stem, sidecar) = RecordingSidecar.orphan(for: session) else {
+            Log.write("wake: no unfinished recording for \(session.bundleID) to resume")
+            return
+        }
 
         do {
             _ = try recorder.start(session: session, resuming: sidecar)
@@ -541,6 +542,24 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         switch outcome {
         case .completed(let session):
             guard let recording = recorder.finish() else {
+                // Nothing open, but the session may still have segments
+                // on disk: sleep closed them and the wake never resumed.
+                // The meeting is over, so finish it now rather than at
+                // whatever launch comes next.
+                if let (stem, sidecar) = RecordingSidecar.orphan(for: session),
+                    !sidecar.segments.isEmpty
+                {
+                    Log.write(
+                        "session \(session.bundleID) ended while closed — "
+                            + "encoding \(stem): \(sidecar.segments.count) segment(s)")
+                    encodeAndQueue(
+                        stem: stem, sidecar: sidecar,
+                        title: MeetingTitle.title(
+                            bundleID: sidecar.bundleID, isManual: sidecar.isManual),
+                        occurredAt: sidecar.startedAt)
+                    refreshMenu()
+                    return
+                }
                 note(session.bundleID, session.startedAt, "nothing was captured")
                 refreshMenu()
                 return
